@@ -14,9 +14,7 @@ Run alongside the bot:
 Then open: http://localhost:5000
 """
 
-import json
-import os
-from datetime import datetime, date
+from datetime import datetime
 from threading import Thread
 
 from flask import Flask, jsonify, render_template_string
