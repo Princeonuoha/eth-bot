@@ -1,13 +1,5 @@
 """
-Trader
-──────
-Main trading loop. Ties together:
-  - BinanceClient  (exchange data + order execution)
-  - SignalEngine   (buy/sell decisions)
-  - RiskManager    (daily loss limit, position sizing)
-  - Notifier       (alerts)
-
-Run via: python -m app.main
+Trader — Main trading loop.
 """
 
 import time
@@ -19,12 +11,9 @@ from app.config import settings
 from app.exchange.binance_client import BinanceClient, BotExchangeError
 from app.models.position import Position
 from app.models.trade_event import TradeEvent
+from app.services.coingecko import CoinGeckoSentiment
 from app.services.notifier import Notifier
-from app.strategy.indicators import (
-    compute_ema,
-    compute_pullback_pct,
-    compute_rsi,
-)
+from app.strategy.indicators import compute_ema, compute_pullback_pct, compute_rsi
 from app.strategy.risk_manager import RiskManager
 from app.strategy.signal_engine import is_trend_bullish, should_buy, should_sell
 
@@ -37,17 +26,17 @@ class Trader:
             trade_amount_usdc=settings.trade_amount_usdc,
         )
         self.notifier = Notifier()
+        self.coingecko = CoinGeckoSentiment()
         self.position: Position | None = None
         self._today: date = datetime.utcnow().date()
         self.trade_log: list[TradeEvent] = []
-
-    # ── Main Loop ──────────────────────────────────────────────────────────────
 
     def run(self) -> None:
         logger.info("=" * 60)
         logger.info(f"  ETH Bot starting | symbol={settings.symbol}")
         logger.info(f"  Testnet={settings.testnet} | TP={settings.take_profit_pct}% | SL={settings.stop_loss_pct}%")
         logger.info("=" * 60)
+        self.notifier.bot_started(settings.testnet)
 
         while True:
             try:
@@ -60,15 +49,11 @@ class Trader:
                 break
             except Exception as e:
                 logger.exception(f"Unexpected error: {e}")
-
             time.sleep(settings.loop_interval_seconds)
-
-    # ── Core Tick ──────────────────────────────────────────────────────────────
 
     def _tick(self) -> None:
         symbol = settings.symbol
 
-        # 1. Fetch market data
         price = self.client.get_price(symbol)
         candles_15m = self.client.get_candles(symbol, "15m", limit=250)
         candles_1h = self.client.get_candles(symbol, "1h", limit=250)
@@ -81,14 +66,17 @@ class Trader:
         pullback = compute_pullback_pct(closes_15m)
         trend_ok = is_trend_bullish(price, ema_200)
 
+        cg = self.coingecko.get_sentiment()
+        cg_ok = cg is None or not cg.is_bearish()
+
         logger.debug(
             f"price={price:.4f} | ema200={ema_200:.4f} | "
             f"rsi={rsi:.1f} | pullback={pullback:.2f}% | "
             f"trend={'✅' if trend_ok else '❌'} | "
+            f"cg={cg.sentiment if cg else 'unavailable'} | "
             f"position={'open' if self.position else 'none'}"
         )
 
-        # 2. Check sell first (protects open position regardless of halt)
         if self.position:
             decision = should_sell(
                 entry_price=self.position.entry_price,
@@ -97,11 +85,14 @@ class Trader:
                 stop_loss_pct=settings.stop_loss_pct,
             )
             if decision:
-                self._execute_sell(price, decision)
+                self._execute_sell(price, decision, cg_summary=cg.summary if cg else None)
                 return
 
-        # 3. Check buy
         if not self.risk.can_trade():
+            return
+
+        if not cg_ok:
+            logger.info(f"CoinGecko: skipping buy — macro sentiment is BEARISH ({cg.summary})")
             return
 
         if should_buy(
@@ -112,66 +103,47 @@ class Trader:
             rsi_oversold=settings.rsi_oversold,
             pullback_min_pct=settings.pullback_min_pct,
         ):
-            self._execute_buy(price)
+            self._execute_buy(price, cg_summary=cg.summary if cg else None)
 
-    # ── Order Execution ────────────────────────────────────────────────────────
-
-    def _execute_buy(self, price: float) -> None:
+    def _execute_buy(self, price: float, cg_summary: str | None = None) -> None:
         usdc_amount = self.risk.position_size_usdc()
         order = self.client.place_market_buy(settings.symbol, usdc_amount)
-
-        # Parse filled quantity from order response
         qty = float(order.get("executedQty", 0))
         avg_price = float(order.get("cummulativeQuoteQty", usdc_amount)) / qty if qty else price
-
         self.position = Position(
             symbol=settings.symbol,
             entry_price=avg_price,
             quantity=qty,
             order_id=str(order.get("orderId", "")),
         )
-
-        event = TradeEvent(
-            symbol=settings.symbol,
-            side="BUY",
-            price=avg_price,
-            quantity=qty,
-            reason="signal",
+        self.trade_log.append(
+            TradeEvent(symbol=settings.symbol, side="BUY", price=avg_price, quantity=qty, reason="signal")
         )
-        self.trade_log.append(event)
-        self.notifier.trade_opened(settings.symbol, avg_price, qty, usdc_amount)
+        self.notifier.trade_opened(settings.symbol, avg_price, qty, usdc_amount, cg_summary=cg_summary)
 
-    def _execute_sell(self, price: float, reason: str) -> None:
+    def _execute_sell(self, price: float, reason: str, cg_summary: str | None = None) -> None:
         if not self.position:
             return
-
         order = self.client.place_market_sell(settings.symbol, self.position.quantity)
         avg_price = (
             float(order.get("cummulativeQuoteQty", 0)) / self.position.quantity
             if self.position.quantity
             else price
         )
-
         pnl_usdc = self.position.pnl_usdc(avg_price)
         pnl_pct = self.position.pnl_pct(avg_price)
-
-        event = TradeEvent(
-            symbol=settings.symbol,
-            side="SELL",
-            price=avg_price,
-            quantity=self.position.quantity,
-            reason=reason,
+        self.trade_log.append(
+            TradeEvent(symbol=settings.symbol, side="SELL", price=avg_price, quantity=self.position.quantity, reason=reason)
         )
-        self.trade_log.append(event)
         self.risk.record_trade_result(pnl_usdc)
-        self.notifier.trade_closed(settings.symbol, reason, pnl_usdc, pnl_pct)
-
+        self.notifier.trade_closed(
+            settings.symbol, reason, pnl_usdc, pnl_pct,
+            daily_pnl=self.risk._daily_pnl_usdc,
+            cg_summary=cg_summary,
+        )
         if self.risk.is_halted:
-            self.notifier.daily_halted(pnl_usdc)
-
+            self.notifier.daily_halted(self.risk._daily_pnl_usdc)
         self.position = None
-
-    # ── Daily Reset ────────────────────────────────────────────────────────────
 
     def _maybe_reset_daily(self) -> None:
         today = datetime.utcnow().date()

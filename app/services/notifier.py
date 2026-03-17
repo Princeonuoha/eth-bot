@@ -1,8 +1,7 @@
 """
 Notifier
 ────────
-Sends Telegram messages on key events (trade open, close, daily halt).
-Safe to use without credentials — it just logs instead.
+Sends Telegram messages on key events.
 """
 
 import requests
@@ -15,7 +14,7 @@ class Notifier:
     def __init__(self):
         self._enabled = bool(settings.telegram_bot_token and settings.telegram_chat_id)
         if self._enabled:
-            logger.info("Notifier: Telegram notifications enabled")
+            logger.info("Notifier: Telegram notifications enabled ✅")
         else:
             logger.info("Notifier: Telegram not configured — logging only")
 
@@ -33,23 +32,67 @@ class Notifier:
         except Exception as e:
             logger.warning(f"Notifier: Telegram send failed — {e}")
 
-    def trade_opened(self, symbol: str, price: float, qty: float, usdc: float) -> None:
-        self.send(
-            f"🟢 <b>BUY</b> {symbol}\n"
-            f"Price: <code>{price:.4f}</code>\n"
-            f"Qty: <code>{qty:.5f} ETH</code>\n"
-            f"Cost: <code>{usdc:.2f} USDC</code>"
-        )
+    def trade_opened(self, symbol, price, qty, usdc_spent, cg_summary=None):
+        from datetime import datetime
 
-    def trade_closed(self, symbol: str, reason: str, pnl_usdc: float, pnl_pct: float) -> None:
+        time_str = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+        lines = [
+            "🟢 <b>BUY EXECUTED</b>",
+            "━━━━━━━━━━━━━━━━━━━━",
+            f"📌 Pair:    <code>{symbol}</code>",
+            f"💲 Price:   <code>${price:,.4f}</code>",
+            f"📦 Qty:     <code>{qty:.5f} ETH</code>",
+            f"💵 Spent:   <code>${usdc_spent:.2f} USDC</code>",
+            f"🕐 Time:    <code>{time_str}</code>",
+        ]
+        if cg_summary:
+            lines += ["━━━━━━━━━━━━━━━━━━━━", f"📊 Market:  <code>{cg_summary}</code>"]
+        self.send("\n".join(lines))
+
+    def trade_closed(self, symbol, reason, pnl_usdc, pnl_pct, daily_pnl=0.0, cg_summary=None):
+        from datetime import datetime
+
+        time_str = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
         emoji = "💰" if pnl_usdc >= 0 else "🔴"
-        self.send(
-            f"{emoji} <b>SELL</b> {symbol} [{reason.upper()}]\n"
-            f"PnL: <code>{pnl_usdc:+.2f} USDC ({pnl_pct:+.2f}%)</code>"
+        reason_label = {"take_profit": "✅ Take Profit", "stop_loss": "🛑 Stop Loss"}.get(
+            reason, reason.upper()
         )
+        daily_emoji = "📈" if daily_pnl >= 0 else "📉"
+        lines = [
+            f"{emoji} <b>SELL EXECUTED</b>",
+            "━━━━━━━━━━━━━━━━━━━━",
+            f"📌 Pair:      <code>{symbol}</code>",
+            f"🏷 Reason:    <b>{reason_label}</b>",
+            f"💰 Trade PnL: <code>{pnl_usdc:+.2f} USDC ({pnl_pct:+.2f}%)</code>",
+            f"{daily_emoji} Day PnL:  <code>{daily_pnl:+.2f} USDC</code>",
+            f"🕐 Time:      <code>{time_str}</code>",
+        ]
+        if cg_summary:
+            lines += ["━━━━━━━━━━━━━━━━━━━━", f"📊 Market:    <code>{cg_summary}</code>"]
+        self.send("\n".join(lines))
 
     def daily_halted(self, daily_pnl: float) -> None:
-        self.send(
-            f"🚫 <b>Bot halted for today</b>\n"
-            f"Daily PnL: <code>{daily_pnl:+.2f} USDC</code>"
-        )
+        from datetime import datetime
+
+        date_str = datetime.utcnow().strftime("%Y-%m-%d")
+        lines = [
+            "🚫 <b>BOT HALTED FOR TODAY</b>",
+            "━━━━━━━━━━━━━━━━━━━━",
+            f"📅 Date:      <code>{date_str}</code>",
+            f"📉 Day PnL:   <code>{daily_pnl:+.2f} USDC</code>",
+            "ℹ️ Bot will resume tomorrow at midnight UTC.",
+        ]
+        self.send("\n".join(lines))
+
+    def bot_started(self, testnet: bool) -> None:
+        mode = "🧪 TESTNET" if testnet else "🔴 LIVE"
+        lines = [
+            "🤖 <b>ETH Bot Started</b>",
+            "━━━━━━━━━━━━━━━━━━━━",
+            f"Mode: <b>{mode}</b>",
+            "Pair: <code>ETHUSDC</code>",
+            f"TP: <code>{settings.take_profit_pct}%</code> | SL: <code>{settings.stop_loss_pct}%</code>",
+            f"Trade size: <code>${settings.trade_amount_usdc:.0f} USDC</code>",
+            f"Daily limit: <code>-${settings.daily_loss_limit_usdc:.0f} USDC</code>",
+        ]
+        self.send("\n".join(lines))
