@@ -1,5 +1,7 @@
 import sys
+
 from loguru import logger
+
 from app.services.trader import Trader
 
 # ── Logging setup ─────────────────────────────────────────────────────────────

@@ -1,4 +1,3 @@
-import pytest
 from app.strategy.risk_manager import RiskManager
 
 

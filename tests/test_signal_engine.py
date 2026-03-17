@@ -3,9 +3,7 @@ Unit tests for signal_engine.py
 Run with: pytest tests/
 """
 
-import pytest
-from app.strategy.signal_engine import should_buy, should_sell, is_trend_bullish
-
+from app.strategy.signal_engine import is_trend_bullish, should_buy, should_sell
 
 # ── is_trend_bullish ──────────────────────────────────────────────────────────
 

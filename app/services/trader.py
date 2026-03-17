@@ -11,7 +11,7 @@ Run via: python -m app.main
 """
 
 import time
-from datetime import datetime, date
+from datetime import date, datetime
 
 from loguru import logger
 
@@ -21,9 +21,9 @@ from app.models.position import Position
 from app.models.trade_event import TradeEvent
 from app.services.notifier import Notifier
 from app.strategy.indicators import (
-    compute_rsi,
     compute_ema,
     compute_pullback_pct,
+    compute_rsi,
 )
 from app.strategy.risk_manager import RiskManager
 from app.strategy.signal_engine import is_trend_bullish, should_buy, should_sell
