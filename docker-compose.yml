@@ -1,0 +1,16 @@
+version: "3.9"
+
+services:
+  eth-bot:
+    build: .
+    container_name: eth-bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./logs:/app/logs
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "5"
