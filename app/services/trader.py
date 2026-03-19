@@ -3,9 +3,9 @@ Trader — Main trading loop.
 """
 
 import time
-import requests
-from datetime import datetime, date
+from datetime import date, datetime
 
+import requests
 from loguru import logger
 
 from app.config import settings

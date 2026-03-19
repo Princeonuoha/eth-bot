@@ -68,7 +68,7 @@ class Notifier:
                 f"🔷 ETH held:   <code>{balance_eth:.5f} ETH</code>" if balance_eth is not None else "",
                 f"📊 Total val:  <code>${total_value:.2f} USDC</code>" if total_value is not None else "",
             ]
-            lines = [l for l in lines if l]  # remove empty
+            lines = [l for line in lines if line]  # remove empty
 
         if cg_summary:
             lines += [
@@ -118,7 +118,7 @@ class Notifier:
                 f"🔷 ETH held:   <code>{balance_eth:.5f} ETH</code>" if balance_eth is not None else "",
                 f"📊 Total val:  <code>${total_value:.2f} USDC</code>" if total_value is not None else "",
             ]
-            lines = [l for l in lines if l]
+            lines = [l for line in lines if line]
 
         if cg_summary:
             lines += [

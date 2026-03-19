@@ -13,11 +13,11 @@ Run alongside the bot:
 Then open: http://localhost:5000
 """
 
-import sqlite3
 import json
 import os
+import sqlite3
 from datetime import datetime
-from threading import Thread, Lock
+from threading import Lock, Thread
 
 from flask import Flask, jsonify, render_template_string, request
 from loguru import logger
