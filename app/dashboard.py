@@ -1,12 +1,11 @@
 """
 Dashboard
 ─────────
-A lightweight Flask web dashboard that shows:
-  - Live ETH price + bot status
-  - Open position details
-  - Trade history
-  - Daily PnL
-  - CoinGecko sentiment
+Lightweight Flask web dashboard with SQLite persistence.
+- All trades saved to trades.db — survives restarts
+- Live USDC + ETH balance display
+- Open position tracking
+- CoinGecko sentiment
 
 Run alongside the bot:
   python -m app.dashboard
@@ -14,10 +13,13 @@ Run alongside the bot:
 Then open: http://localhost:5000
 """
 
+import sqlite3
+import json
+import os
 from datetime import datetime
-from threading import Thread
+from threading import Thread, Lock
 
-from flask import Flask, jsonify, render_template_string
+from flask import Flask, jsonify, render_template_string, request
 from loguru import logger
 
 from app.config import settings
@@ -26,7 +28,10 @@ from app.services.coingecko import CoinGeckoSentiment
 
 app = Flask(__name__)
 
-# ── Shared state (updated by background thread) ───────────────────────────────
+DB_PATH = os.path.join(os.path.dirname(__file__), "..", "trades.db")
+_db_lock = Lock()
+
+# ── Shared state ──────────────────────────────────────────────────────────────
 _state = {
     "price": 0.0,
     "price_updated": None,
@@ -37,11 +42,91 @@ _state = {
     "daily_trades": 0,
     "bot_running": False,
     "last_error": None,
+    "balance_usdc": 0.0,
+    "balance_eth": 0.0,
+    "total_value_usdc": 0.0,
 }
 
 _client = None
 _coingecko = CoinGeckoSentiment()
 
+
+# ── SQLite ────────────────────────────────────────────────────────────────────
+
+def _init_db():
+    with _db_lock:
+        con = sqlite3.connect(DB_PATH)
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS trades (
+                id        INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT,
+                side      TEXT,
+                price     REAL,
+                quantity  REAL,
+                pnl_usdc  REAL,
+                pnl_pct   REAL,
+                daily_pnl REAL,
+                reason    TEXT,
+                raw_json  TEXT
+            )
+        """)
+        con.commit()
+        con.close()
+    logger.info(f"Dashboard: SQLite DB ready at {DB_PATH}")
+
+
+def _save_trade(trade: dict):
+    with _db_lock:
+        con = sqlite3.connect(DB_PATH)
+        con.execute(
+            """INSERT INTO trades
+               (timestamp, side, price, quantity, pnl_usdc, pnl_pct, daily_pnl, reason, raw_json)
+               VALUES (?,?,?,?,?,?,?,?,?)""",
+            (
+                trade.get("timestamp"),
+                trade.get("side"),
+                trade.get("price"),
+                trade.get("quantity"),
+                trade.get("pnl_usdc"),
+                trade.get("pnl_pct"),
+                trade.get("daily_pnl"),
+                trade.get("reason"),
+                json.dumps(trade),
+            ),
+        )
+        con.commit()
+        con.close()
+
+
+def _load_trades() -> list:
+    with _db_lock:
+        con = sqlite3.connect(DB_PATH)
+        rows = con.execute(
+            "SELECT raw_json FROM trades ORDER BY id DESC LIMIT 200"
+        ).fetchall()
+        con.close()
+    trades = []
+    for (raw,) in rows:
+        try:
+            trades.append(json.loads(raw))
+        except Exception:
+            pass
+    return trades
+
+
+def _compute_daily_pnl(trades: list) -> tuple:
+    today = datetime.utcnow().date().isoformat()
+    daily_pnl = 0.0
+    daily_trades = 0
+    for t in trades:
+        ts = (t.get("timestamp") or "")[:10]
+        if ts == today and t.get("side") == "SELL":
+            daily_pnl += t.get("pnl_usdc") or 0.0
+            daily_trades += 1
+    return round(daily_pnl, 4), daily_trades
+
+
+# ── Background refresh ────────────────────────────────────────────────────────
 
 def _refresh_loop():
     global _client
@@ -52,11 +137,25 @@ def _refresh_loop():
         _state["last_error"] = str(e)
         return
 
+    import time
     while True:
-        import time
         try:
-            _state["price"] = _client.get_price(settings.symbol)
+            price = _client.get_price(settings.symbol)
+            _state["price"] = price
             _state["price_updated"] = datetime.utcnow().strftime("%H:%M:%S UTC")
+
+            # Live balances from Binance
+            usdc = _client.get_balance("USDC")
+            eth = _client.get_balance("ETH")
+            _state["balance_usdc"] = round(usdc, 2)
+            _state["balance_eth"] = round(eth, 6)
+            _state["total_value_usdc"] = round(usdc + eth * price, 2)
+
+            # Keep unrealised PnL live on open position
+            if _state["position"]:
+                _state["position"]["current_price"] = price
+
+            # Sentiment
             cg = _coingecko.get_sentiment()
             if cg:
                 _state["sentiment"] = {
@@ -87,19 +186,34 @@ def api_state():
 
 @app.route("/api/trade", methods=["POST"])
 def add_trade():
-    """Called by trader.py to log trades into the dashboard."""
-    from flask import request
     trade = request.json
     trade["timestamp"] = datetime.utcnow().isoformat()
+
+    # Persist to SQLite — survives restarts
+    _save_trade(trade)
+
+    # Update in-memory list
     _state["trades"].insert(0, trade)
-    _state["trades"] = _state["trades"][:50]  # keep last 50
-    if trade["side"] == "SELL":
-        _state["daily_pnl"] = round(_state["daily_pnl"] + trade.get("pnl_usdc", 0), 4)
-        _state["daily_trades"] += 1
+    _state["trades"] = _state["trades"][:200]
+
+    # Recompute daily stats
+    _state["daily_pnl"], _state["daily_trades"] = _compute_daily_pnl(_state["trades"])
+
+    # Track open position
+    if trade["side"] == "BUY":
+        _state["position"] = {
+            "entry_price": trade["price"],
+            "quantity": trade["quantity"],
+            "entry_time": trade["timestamp"],
+            "current_price": _state["price"] or trade["price"],
+        }
+    elif trade["side"] == "SELL":
+        _state["position"] = None
+
     return jsonify({"ok": True})
 
 
-# ── HTML Dashboard ─────────────────────────────────────────────────────────────
+# ── HTML ───────────────────────────────────────────────────────────────────────
 
 DASHBOARD_HTML = """
 <!DOCTYPE html>
@@ -112,18 +226,20 @@ DASHBOARD_HTML = """
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #0f1117; color: #e2e8f0; min-height: 100vh; padding: 24px; }
-  h1 { font-size: 20px; font-weight: 600; color: #f8fafc; margin-bottom: 24px; display: flex; align-items: center; gap: 10px; }
+  h1 { font-size: 20px; font-weight: 600; color: #f8fafc; margin-bottom: 20px; display: flex; align-items: center; gap: 10px; }
   .dot { width: 8px; height: 8px; border-radius: 50%; background: #22c55e; animation: pulse 2s infinite; }
   @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.4} }
-  .grid-4 { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-bottom: 20px; }
-  .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-bottom: 20px; }
+  .grid-5 { display: grid; grid-template-columns: repeat(5, 1fr); gap: 12px; margin-bottom: 14px; }
+  .grid-3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin-bottom: 14px; }
+  .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-bottom: 14px; }
   .card { background: #1e2130; border: 1px solid #2d3148; border-radius: 12px; padding: 16px 20px; }
   .card-label { font-size: 12px; color: #64748b; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 6px; }
-  .card-value { font-size: 24px; font-weight: 700; color: #f8fafc; }
+  .card-value { font-size: 22px; font-weight: 700; color: #f8fafc; }
   .card-sub { font-size: 12px; color: #64748b; margin-top: 4px; }
   .positive { color: #22c55e; }
   .negative { color: #ef4444; }
-  .neutral { color: #94a3b8; }
+  .balance-card { background: #0f1f17; border: 1px solid #166534; border-radius: 12px; padding: 16px 20px; }
+  .balance-total { font-size: 24px; font-weight: 700; color: #22c55e; }
   .badge { display: inline-block; padding: 3px 10px; border-radius: 20px; font-size: 11px; font-weight: 600; text-transform: uppercase; }
   .badge-bullish { background: #14532d; color: #22c55e; }
   .badge-bearish { background: #450a0a; color: #ef4444; }
@@ -136,10 +252,10 @@ DASHBOARD_HTML = """
   tr:last-child td { border-bottom: none; }
   .side-buy { color: #22c55e; font-weight: 600; }
   .side-sell { color: #f97316; font-weight: 600; }
-  .chart-wrap { position: relative; height: 220px; }
+  .chart-wrap { position: relative; height: 200px; }
   .section-title { font-size: 13px; font-weight: 600; color: #94a3b8; margin-bottom: 12px; text-transform: uppercase; letter-spacing: 0.05em; }
-  .position-card { background: #0f2a1a; border: 1px solid #166534; border-radius: 12px; padding: 16px 20px; margin-bottom: 20px; }
-  .no-position { background: #1e2130; border: 1px dashed #2d3148; border-radius: 12px; padding: 16px 20px; margin-bottom: 20px; text-align: center; color: #475569; font-size: 13px; }
+  .position-card { background: #0f2a1a; border: 1px solid #166534; border-radius: 12px; padding: 16px 20px; margin-bottom: 14px; }
+  .no-position { background: #1e2130; border: 1px dashed #2d3148; border-radius: 12px; padding: 14px 20px; margin-bottom: 14px; text-align: center; color: #475569; font-size: 13px; }
   .updated { font-size: 11px; color: #475569; margin-top: 2px; }
 </style>
 </head>
@@ -147,26 +263,49 @@ DASHBOARD_HTML = """
 
 <h1><div class="dot"></div> ETH Bot Dashboard</h1>
 
-<div class="grid-4">
+<div class="grid-5">
   <div class="card">
     <div class="card-label">ETH Price</div>
     <div class="card-value" id="price">—</div>
     <div class="updated" id="price-updated">—</div>
+  </div>
+  <div class="balance-card">
+    <div class="card-label">💰 Total Value</div>
+    <div class="balance-total" id="total-value">$0.00</div>
+    <div class="card-sub" id="balance-sub">loading...</div>
+  </div>
+  <div class="card">
+    <div class="card-label">USDC Balance</div>
+    <div class="card-value" id="balance-usdc">$0.00</div>
+    <div class="card-sub">free / available</div>
+  </div>
+  <div class="card">
+    <div class="card-label">ETH Holdings</div>
+    <div class="card-value" id="balance-eth" style="font-size:18px;">0.00000</div>
+    <div class="card-sub" id="eth-value-usdc">≈ $0.00</div>
   </div>
   <div class="card">
     <div class="card-label">Daily PnL</div>
     <div class="card-value" id="daily-pnl">$0.00</div>
     <div class="card-sub" id="daily-trades">0 trades today</div>
   </div>
+</div>
+
+<div class="grid-3">
   <div class="card">
-    <div class="card-label">Trades Total</div>
+    <div class="card-label">Total Closed Trades</div>
     <div class="card-value" id="total-trades">0</div>
-    <div class="card-sub">all time</div>
+    <div class="card-sub">all time (from DB)</div>
+  </div>
+  <div class="card">
+    <div class="card-label">Daily Loss Used</div>
+    <div class="card-value" id="limit-used">$0.00</div>
+    <div class="card-sub" id="limit-pct">0% of daily limit</div>
   </div>
   <div class="card">
     <div class="card-label">Bot Status</div>
-    <div class="card-value" id="bot-status" style="font-size:16px; margin-top:4px;">—</div>
-    <div class="card-sub" id="last-error" style="color:#ef4444;"></div>
+    <div class="card-value" id="bot-status" style="font-size:16px;margin-top:4px;">—</div>
+    <div class="card-sub" id="last-error" style="color:#ef4444;font-size:11px;"></div>
   </div>
 </div>
 
@@ -175,12 +314,10 @@ DASHBOARD_HTML = """
 <div class="grid-2">
   <div class="card">
     <div class="section-title">CoinGecko Sentiment</div>
-    <div id="sentiment-content">
-      <div style="color:#475569; font-size:13px;">Loading...</div>
-    </div>
+    <div id="sentiment-content"><div style="color:#475569;font-size:13px;">Loading...</div></div>
   </div>
   <div class="card">
-    <div class="section-title">Daily PnL Chart</div>
+    <div class="section-title">Cumulative PnL</div>
     <div class="chart-wrap"><canvas id="pnlChart"></canvas></div>
   </div>
 </div>
@@ -189,158 +326,121 @@ DASHBOARD_HTML = """
   <div class="section-title">Trade History</div>
   <table>
     <thead><tr>
-      <th>Time</th><th>Side</th><th>Price</th><th>Qty</th><th>PnL</th><th>Reason</th>
+      <th>Time</th><th>Side</th><th>Price</th><th>Qty (ETH)</th><th>Spent/Received</th><th>Trade PnL</th><th>Day PnL</th><th>Reason</th>
     </tr></thead>
-    <tbody id="trade-tbody"><tr><td colspan="6" style="color:#475569; text-align:center;">No trades yet</td></tr></tbody>
+    <tbody id="trade-tbody"><tr><td colspan="8" style="color:#475569;text-align:center;">No trades yet</td></tr></tbody>
   </table>
 </div>
 
 <script>
 let pnlChart;
-let pnlData = { labels: [], values: [] };
-
 function initChart() {
   const ctx = document.getElementById('pnlChart').getContext('2d');
   pnlChart = new Chart(ctx, {
     type: 'line',
-    data: {
-      labels: pnlData.labels,
-      datasets: [{
-        label: 'PnL (USDC)',
-        data: pnlData.values,
-        borderColor: '#22c55e',
-        backgroundColor: 'rgba(34,197,94,0.08)',
-        borderWidth: 2,
-        pointRadius: 4,
-        pointBackgroundColor: '#22c55e',
-        fill: true,
-        tension: 0.3,
-      }]
-    },
-    options: {
-      responsive: true,
-      maintainAspectRatio: false,
-      plugins: { legend: { display: false } },
-      scales: {
-        x: { ticks: { color: '#475569', font: { size: 11 } }, grid: { color: '#1a1f35' } },
-        y: { ticks: { color: '#475569', font: { size: 11 }, callback: v => '$' + v.toFixed(2) }, grid: { color: '#1a1f35' } }
-      }
+    data: { labels: [], datasets: [{ label: 'PnL (USDC)', data: [], borderColor: '#22c55e', backgroundColor: 'rgba(34,197,94,0.08)', borderWidth: 2, pointRadius: 3, fill: true, tension: 0.3 }] },
+    options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false } },
+      scales: { x: { ticks: { color: '#475569', font: { size: 10 } }, grid: { color: '#1a1f35' } }, y: { ticks: { color: '#475569', font: { size: 10 }, callback: v => '$'+v.toFixed(2) }, grid: { color: '#1a1f35' } } }
     }
   });
 }
-
-function fmtTime(iso) {
-  if (!iso) return '—';
-  return iso.slice(11, 16) + ' UTC';
-}
-
+function fmtTime(iso) { return iso ? iso.slice(11,16)+' UTC' : '—'; }
 function fmtPnl(v) {
   if (v == null) return '—';
   const cls = v >= 0 ? 'positive' : 'negative';
-  return `<span class="${cls}">${v >= 0 ? '+' : ''}$${parseFloat(v).toFixed(2)}</span>`;
+  return `<span class="${cls}">${v>=0?'+':''}$${Math.abs(parseFloat(v)).toFixed(2)}</span>`;
 }
-
 function updateSentiment(s) {
   if (!s) { document.getElementById('sentiment-content').innerHTML = '<div style="color:#475569;font-size:13px;">Unavailable</div>'; return; }
-  const badgeClass = `badge-${s.label}`;
-  const fillColor = s.label === 'bullish' ? '#22c55e' : s.label === 'bearish' ? '#ef4444' : '#64748b';
+  const fc = s.label==='bullish'?'#22c55e':s.label==='bearish'?'#ef4444':'#64748b';
   document.getElementById('sentiment-content').innerHTML = `
     <div style="display:flex;align-items:center;gap:10px;margin-bottom:12px;">
-      <span class="badge ${badgeClass}">${s.label}</span>
-      <span style="font-size:13px;color:#94a3b8;">${s.strength}/100 strength</span>
+      <span class="badge badge-${s.label}">${s.label}</span>
+      <span style="font-size:13px;color:#94a3b8;">${s.strength}/100</span>
     </div>
-    <div class="sentiment-bar"><div class="sentiment-fill" style="width:${s.strength}%;background:${fillColor};"></div></div>
+    <div class="sentiment-bar"><div class="sentiment-fill" style="width:${s.strength}%;background:${fc};"></div></div>
     <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;margin-top:14px;">
-      <div style="text-align:center;">
-        <div style="font-size:11px;color:#475569;margin-bottom:2px;">1H</div>
-        <div style="font-size:15px;font-weight:600;" class="${s.change_1h >= 0 ? 'positive' : 'negative'}">${s.change_1h >= 0 ? '+' : ''}${parseFloat(s.change_1h).toFixed(2)}%</div>
-      </div>
-      <div style="text-align:center;">
-        <div style="font-size:11px;color:#475569;margin-bottom:2px;">24H</div>
-        <div style="font-size:15px;font-weight:600;" class="${s.change_24h >= 0 ? 'positive' : 'negative'}">${s.change_24h >= 0 ? '+' : ''}${parseFloat(s.change_24h).toFixed(2)}%</div>
-      </div>
-      <div style="text-align:center;">
-        <div style="font-size:11px;color:#475569;margin-bottom:2px;">7D</div>
-        <div style="font-size:15px;font-weight:600;" class="${s.change_7d >= 0 ? 'positive' : 'negative'}">${s.change_7d >= 0 ? '+' : ''}${parseFloat(s.change_7d).toFixed(2)}%</div>
-      </div>
-    </div>
-  `;
+      <div style="text-align:center;"><div style="font-size:11px;color:#475569;margin-bottom:2px;">1H</div><div style="font-size:15px;font-weight:600;" class="${s.change_1h>=0?'positive':'negative'}">${s.change_1h>=0?'+':''}${parseFloat(s.change_1h).toFixed(2)}%</div></div>
+      <div style="text-align:center;"><div style="font-size:11px;color:#475569;margin-bottom:2px;">24H</div><div style="font-size:15px;font-weight:600;" class="${s.change_24h>=0?'positive':'negative'}">${s.change_24h>=0?'+':''}${parseFloat(s.change_24h).toFixed(2)}%</div></div>
+      <div style="text-align:center;"><div style="font-size:11px;color:#475569;margin-bottom:2px;">7D</div><div style="font-size:15px;font-weight:600;" class="${s.change_7d>=0?'positive':'negative'}">${s.change_7d>=0?'+':''}${parseFloat(s.change_7d).toFixed(2)}%</div></div>
+    </div>`;
 }
-
-function updatePosition(pos) {
+function updatePosition(pos, price) {
   const el = document.getElementById('position-section');
-  if (!pos) {
-    el.innerHTML = '<div class="no-position">No open position — bot is watching for signals</div>';
-    return;
-  }
-  const pnl = ((pos.current_price - pos.entry_price) / pos.entry_price * 100).toFixed(2);
-  const pnlUsdc = ((pos.current_price - pos.entry_price) * pos.quantity).toFixed(2);
-  const cls = pnl >= 0 ? 'positive' : 'negative';
-  el.innerHTML = `
-    <div class="position-card" style="margin-bottom:20px;">
-      <div class="section-title" style="color:#22c55e;">Open Position</div>
-      <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:16px;margin-top:8px;">
-        <div><div style="font-size:11px;color:#64748b;margin-bottom:3px;">Entry Price</div><div style="font-weight:600;">$${parseFloat(pos.entry_price).toFixed(4)}</div></div>
-        <div><div style="font-size:11px;color:#64748b;margin-bottom:3px;">Quantity</div><div style="font-weight:600;">${parseFloat(pos.quantity).toFixed(5)} ETH</div></div>
-        <div><div style="font-size:11px;color:#64748b;margin-bottom:3px;">Unrealised PnL</div><div style="font-weight:600;" class="${cls}">${pnl >= 0 ? '+' : ''}${pnlUsdc} USDC (${pnl}%)</div></div>
-        <div><div style="font-size:11px;color:#64748b;margin-bottom:3px;">Opened</div><div style="font-weight:600;">${fmtTime(pos.entry_time)}</div></div>
-      </div>
-    </div>
-  `;
+  if (!pos) { el.innerHTML = '<div class="no-position">No open position — bot is watching for signals</div>'; return; }
+  const cp = pos.current_price || price || pos.entry_price;
+  const pnlPct = ((cp - pos.entry_price) / pos.entry_price * 100).toFixed(2);
+  const pnlUsdc = ((cp - pos.entry_price) * pos.quantity).toFixed(2);
+  const cls = pnlPct >= 0 ? 'positive' : 'negative';
+  el.innerHTML = `<div class="position-card">
+    <div class="section-title" style="color:#22c55e;">⚡ Open Position</div>
+    <div style="display:grid;grid-template-columns:repeat(5,1fr);gap:16px;margin-top:8px;">
+      <div><div style="font-size:11px;color:#64748b;margin-bottom:3px;">Entry Price</div><div style="font-weight:600;">$${parseFloat(pos.entry_price).toFixed(4)}</div></div>
+      <div><div style="font-size:11px;color:#64748b;margin-bottom:3px;">Current Price</div><div style="font-weight:600;">$${parseFloat(cp).toFixed(4)}</div></div>
+      <div><div style="font-size:11px;color:#64748b;margin-bottom:3px;">Quantity</div><div style="font-weight:600;">${parseFloat(pos.quantity).toFixed(5)} ETH</div></div>
+      <div><div style="font-size:11px;color:#64748b;margin-bottom:3px;">Unrealised PnL</div><div style="font-weight:600;" class="${cls}">${pnlPct>=0?'+':''}$${pnlUsdc} (${pnlPct}%)</div></div>
+      <div><div style="font-size:11px;color:#64748b;margin-bottom:3px;">Opened</div><div style="font-weight:600;">${fmtTime(pos.entry_time)}</div></div>
+    </div></div>`;
 }
-
 function updateTrades(trades) {
+  const sells = trades.filter(t => t.side === 'SELL');
+  document.getElementById('total-trades').textContent = sells.length;
   const tbody = document.getElementById('trade-tbody');
   if (!trades.length) return;
-  tbody.innerHTML = trades.map(t => `
-    <tr>
+  tbody.innerHTML = trades.map(t => {
+    const val = (t.price * t.quantity).toFixed(2);
+    const spent = t.side==='BUY' ? `<span style="color:#ef4444;">-$${val}</span>` : `<span style="color:#22c55e;">+$${val}</span>`;
+    return `<tr>
       <td>${fmtTime(t.timestamp)}</td>
       <td class="side-${t.side.toLowerCase()}">${t.side}</td>
       <td>$${parseFloat(t.price).toFixed(4)}</td>
       <td>${parseFloat(t.quantity).toFixed(5)}</td>
-      <td>${t.pnl_usdc != null ? fmtPnl(t.pnl_usdc) : '—'}</td>
-      <td style="color:#64748b;">${t.reason || '—'}</td>
-    </tr>
-  `).join('');
-
-  // Update PnL chart from sell trades
-  const sells = trades.filter(t => t.side === 'SELL').reverse();
-  pnlData.labels = sells.map(t => fmtTime(t.timestamp));
+      <td>${spent}</td>
+      <td>${t.pnl_usdc!=null?fmtPnl(t.pnl_usdc):'—'}</td>
+      <td>${t.daily_pnl!=null?fmtPnl(t.daily_pnl):'—'}</td>
+      <td style="color:#64748b;">${t.reason||'—'}</td>
+    </tr>`;
+  }).join('');
+  // Chart
+  const sorted = [...sells].reverse();
   let running = 0;
-  pnlData.values = sells.map(t => { running += (t.pnl_usdc || 0); return parseFloat(running.toFixed(2)); });
-  if (pnlChart) { pnlChart.data.labels = pnlData.labels; pnlChart.data.datasets[0].data = pnlData.values; pnlChart.update(); }
+  const labels = sorted.map(t => fmtTime(t.timestamp));
+  const values = sorted.map(t => { running += (t.pnl_usdc||0); return parseFloat(running.toFixed(2)); });
+  if (pnlChart) { pnlChart.data.labels=labels; pnlChart.data.datasets[0].data=values; pnlChart.update(); }
 }
-
 async function refresh() {
   try {
     const res = await fetch('/api/state');
     const s = await res.json();
-
     const price = parseFloat(s.price);
-    document.getElementById('price').textContent = price ? '$' + price.toFixed(2) : '—';
+    document.getElementById('price').textContent = price ? '$'+price.toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2}) : '—';
     document.getElementById('price-updated').textContent = s.price_updated || '—';
-
-    const pnl = parseFloat(s.daily_pnl || 0);
+    const usdc = parseFloat(s.balance_usdc||0);
+    const eth = parseFloat(s.balance_eth||0);
+    const total = parseFloat(s.total_value_usdc||0);
+    document.getElementById('total-value').textContent = '$'+total.toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2});
+    document.getElementById('balance-sub').textContent = '$'+usdc.toFixed(2)+' USDC + '+eth.toFixed(5)+' ETH';
+    document.getElementById('balance-usdc').textContent = '$'+usdc.toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2});
+    document.getElementById('balance-eth').textContent = eth.toFixed(5)+' ETH';
+    document.getElementById('eth-value-usdc').textContent = '≈ $'+(eth*price).toFixed(2);
+    const pnl = parseFloat(s.daily_pnl||0);
     const pnlEl = document.getElementById('daily-pnl');
-    pnlEl.textContent = (pnl >= 0 ? '+' : '') + '$' + pnl.toFixed(2);
-    pnlEl.className = 'card-value ' + (pnl > 0 ? 'positive' : pnl < 0 ? 'negative' : '');
-
-    document.getElementById('daily-trades').textContent = (s.daily_trades || 0) + ' trades today';
-    document.getElementById('total-trades').textContent = (s.trades || []).length;
-    document.getElementById('bot-status').innerHTML = s.bot_running
-      ? '<span class="positive">Running</span>'
-      : '<span class="negative">Offline</span>';
+    pnlEl.textContent = (pnl>=0?'+':'')+' $'+Math.abs(pnl).toFixed(2);
+    pnlEl.className = 'card-value '+(pnl>0?'positive':pnl<0?'negative':'');
+    document.getElementById('daily-trades').textContent = (s.daily_trades||0)+' trades today';
+    const lossUsed = Math.abs(Math.min(0,pnl));
+    const limitEl = document.getElementById('limit-used');
+    limitEl.textContent = '-$'+lossUsed.toFixed(2);
+    limitEl.className = 'card-value '+(lossUsed>0?'negative':'');
+    document.getElementById('limit-pct').textContent = (lossUsed/80*100).toFixed(0)+'% of daily limit';
+    document.getElementById('bot-status').innerHTML = s.bot_running ? '<span class="positive">Running ✓</span>' : '<span class="negative">Offline</span>';
     document.getElementById('last-error').textContent = s.last_error || '';
-
     updateSentiment(s.sentiment);
-    updatePosition(s.position);
-    updateTrades(s.trades || []);
+    updatePosition(s.position, price);
+    updateTrades(s.trades||[]);
   } catch(e) { console.error(e); }
 }
-
-initChart();
-refresh();
-setInterval(refresh, 10000);
+initChart(); refresh(); setInterval(refresh, 10000);
 </script>
 </body>
 </html>
@@ -348,6 +448,13 @@ setInterval(refresh, 10000);
 
 
 def start():
+    _init_db()
+    # Restore trades from DB on every startup
+    trades = _load_trades()
+    _state["trades"] = trades
+    _state["daily_pnl"], _state["daily_trades"] = _compute_daily_pnl(trades)
+    logger.info(f"Dashboard: loaded {len(trades)} trades from database")
+
     t = Thread(target=_refresh_loop, daemon=True)
     t.start()
     logger.info("Dashboard running at http://localhost:5000")
