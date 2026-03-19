@@ -145,3 +145,30 @@ docker compose up -d
 ## Disclaimer
 
 This project is for educational purposes. Trading cryptocurrencies carries significant financial risk. Past performance does not guarantee future results.
+
+## Recent Updates
+
+### v4 — SQLite Persistence + Balance Tracking
+- **Trade history** now persists to `trades.db` — survives dashboard restarts
+- **Live balance** displayed on dashboard: USDC, ETH holdings, total portfolio value
+- **Telegram notifications** now include balance after every trade
+- **Exponential backoff cooldown** after stop losses: 15min → 30min → 60min
+- **Open position** now correctly tracked on dashboard
+
+### Configuration (recommended .env settings)
+| Parameter | Recommended | Notes |
+|---|---|---|
+| RSI_OVERSOLD | 38 | Genuine oversold — not 52 |
+| PULLBACK_MIN_PCT | 0.8 | Real pullback filter |
+| STOP_LOSS_PCT | 0.8 | Clears 15m noise floor |
+| TAKE_PROFIT_PCT | 1.2 | 1.5:1 R:R ratio |
+| TRADE_AMOUNT_USDC | 100 | Risk management |
+| DAILY_LOSS_LIMIT_USDC | 15 | 3% of capital |
+
+### Deployment
+Bot runs in `screen` sessions on EC2:
+\`\`\`bash
+screen -S eth-bot python -m app.main        # trading bot
+screen -S dashboard python -m app.dashboard # web dashboard
+\`\`\`
+Dashboard accessible at: \`http://<EC2-IP>:5000\`
