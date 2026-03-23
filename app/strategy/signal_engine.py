@@ -129,3 +129,37 @@ def should_sell(
         "stop_loss" | "trailing_stop" | None
     """
     pnl_pct = ((current_price - entry_price) / entry_price) * 100
+    peak_pct = ((peak_price - entry_price) / entry_price) * 100
+
+    # 1. Hard stop loss — always active, fires first
+    if pnl_pct <= -stop_loss_pct:
+        logger.warning(f"Signal: STOP LOSS 🛑 | PnL={pnl_pct:.2f}%")
+        return "stop_loss"
+
+    # 2. Trailing stop — only activates after price rises enough
+    trailing_active = peak_pct >= trailing_activation_pct
+    if trailing_active:
+        trailing_stop_level = peak_price * (1 - trailing_stop_pct / 100)
+        drop_from_peak = ((peak_price - current_price) / peak_price) * 100
+
+        logger.debug(
+            f"Signal: trailing active | peak=${peak_price:.4f} (+{peak_pct:.2f}%) | "
+            f"stop level=${trailing_stop_level:.4f} | "
+            f"current=${current_price:.4f} | drop_from_peak={drop_from_peak:.2f}%"
+        )
+
+        if current_price <= trailing_stop_level:
+            logger.info(
+                f"Signal: TRAILING STOP 🎯 | "
+                f"peak={peak_pct:.2f}% | locked_in≈{pnl_pct:.2f}% | "
+                f"PnL=${((current_price - entry_price) * 1):.4f}"
+            )
+            return "trailing_stop"
+    else:
+        logger.debug(
+            f"Signal: hold — PnL={pnl_pct:.2f}% | "
+            f"trailing activates at +{trailing_activation_pct}% "
+            f"(need +{trailing_activation_pct - pnl_pct:.2f}% more)"
+        )
+
+    return None
