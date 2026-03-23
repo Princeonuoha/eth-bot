@@ -14,7 +14,14 @@ from app.models.position import Position
 from app.models.trade_event import TradeEvent
 from app.services.coingecko import CoinGeckoSentiment
 from app.services.notifier import Notifier
-from app.strategy.indicators import compute_ema, compute_pullback_pct, compute_rsi
+from app.strategy.indicators import (
+    compute_atr_stop_pct,
+    compute_ema,
+    compute_ema_slope,
+    compute_pullback_pct,
+    compute_rsi,
+    compute_volume_ratio,
+)
 from app.strategy.risk_manager import RiskManager
 from app.strategy.signal_engine import is_trend_bullish, should_buy, should_sell
 
@@ -41,6 +48,9 @@ class Trader:
         # Trailing stop — tracks highest price seen since entry
         self._peak_price: float = 0.0
 
+        # ATR-based dynamic stop — set fresh on each entry
+        self._active_stop_loss_pct: float = settings.stop_loss_pct
+
     def _cooldown_seconds(self) -> int:
         """15min → 30min → 60min after consecutive stop losses."""
         base = 900
@@ -55,6 +65,9 @@ class Trader:
             f"  Trailing: activates at +{settings.trailing_activation_pct}% | "
             f"trails by {settings.trailing_stop_pct}% from peak"
         )
+        logger.info(f"  ATR stop: enabled (multiplier={settings.atr_multiplier}x)")
+        logger.info(f"  EMA slope min: {settings.ema_slope_min_pct}%")
+        logger.info(f"  Max volume ratio: {settings.max_volume_ratio}x")
         logger.info("=" * 60)
         self.notifier.bot_started(settings.testnet)
 
@@ -80,10 +93,15 @@ class Trader:
 
         closes_15m = candles_15m["close"]
         closes_1h = candles_1h["close"]
+        highs_15m = candles_15m["high"]
+        lows_15m = candles_15m["low"]
+        volumes_15m = candles_15m["volume"]
 
         rsi = compute_rsi(closes_15m)
         ema_200 = compute_ema(closes_1h, 200)
+        ema_slope = compute_ema_slope(closes_1h, period=200, lookback=5)
         pullback = compute_pullback_pct(closes_15m)
+        volume_ratio = compute_volume_ratio(volumes_15m)
         trend_ok = is_trend_bullish(price, ema_200)
 
         cg = self.coingecko.get_sentiment()
@@ -100,7 +118,8 @@ class Trader:
 
         logger.debug(
             f"price=${price:.4f} | rsi={rsi:.1f} | pullback={pullback:.2f}% | "
-            f"trend={'✅' if trend_ok else '❌'} | "
+            f"trend={'✅' if trend_ok else '❌'} | ema_slope={ema_slope:.4f}% | "
+            f"vol_ratio={volume_ratio:.2f}x | "
             f"cg={cg.sentiment if cg else 'unavailable'} | "
             f"peak=${self._peak_price:.4f} | "
             f"cooldown={'🕐 ' + str(int(cooldown - seconds_since_sl)) + 's' if in_cooldown else 'none'} | "
@@ -113,7 +132,7 @@ class Trader:
                 entry_price=self.position.entry_price,
                 current_price=price,
                 peak_price=self._peak_price,
-                stop_loss_pct=settings.stop_loss_pct,
+                stop_loss_pct=self._active_stop_loss_pct,  # ATR-dynamic
                 trailing_activation_pct=settings.trailing_activation_pct,
                 trailing_stop_pct=settings.trailing_stop_pct,
             )
@@ -137,12 +156,30 @@ class Trader:
 
         if should_buy(
             trend_bullish=trend_ok,
+            ema_slope=ema_slope,
             rsi=rsi,
             pullback_pct=pullback,
+            volume_ratio=volume_ratio,
             in_position=self.position is not None,
             rsi_oversold=settings.rsi_oversold,
             pullback_min_pct=settings.pullback_min_pct,
+            ema_slope_min_pct=settings.ema_slope_min_pct,
+            max_volume_ratio=settings.max_volume_ratio,
         ):
+            # Compute ATR-based stop loss for this specific entry
+            atr_stop = compute_atr_stop_pct(
+                highs_15m,
+                lows_15m,
+                closes_15m,
+                period=14,
+                multiplier=settings.atr_multiplier,
+            )
+            # Use ATR stop if it's wider than the config minimum — never tighter
+            self._active_stop_loss_pct = max(atr_stop, settings.stop_loss_pct)
+            logger.info(
+                f"ATR stop loss set to {self._active_stop_loss_pct:.2f}% "
+                f"(atr={atr_stop:.2f}%, config_min={settings.stop_loss_pct}%)"
+            )
             self._execute_buy(price, cg_summary=cg.summary if cg else None)
 
     def _get_balances(self) -> tuple[float, float, float]:
@@ -201,15 +238,21 @@ class Trader:
         logger.info(
             f"Trailing stop: activates at ${avg_price * (1 + settings.trailing_activation_pct / 100):.4f} "
             f"(+{settings.trailing_activation_pct}%) | "
-            f"hard stop at ${avg_price * (1 - settings.stop_loss_pct / 100):.4f} "
-            f"(-{settings.stop_loss_pct}%)"
+            f"hard stop at ${avg_price * (1 - self._active_stop_loss_pct / 100):.4f} "
+            f"(-{self._active_stop_loss_pct:.2f}%)"
         )
 
     def _execute_sell(self, price: float, reason: str, cg_summary: str | None = None) -> None:
         if not self.position:
             return
 
-        order = self.client.place_market_sell(settings.symbol, self.position.quantity)
+        order = self.client.place_limit_sell_with_fallback(
+            settings.symbol,
+            self.position.quantity,
+            price,
+            limit_buffer_pct=settings.limit_sell_buffer_pct,
+            fallback_timeout_seconds=settings.limit_sell_timeout_seconds,
+        )
         avg_price = (
             float(order.get("cummulativeQuoteQty", 0)) / self.position.quantity
             if self.position.quantity
@@ -281,6 +324,7 @@ class Trader:
 
         # Reset trailing state
         self._peak_price = 0.0
+        self._active_stop_loss_pct = settings.stop_loss_pct  # reset to config default
         self.position = None
 
     def _push_to_dashboard(self, trade: dict) -> None:
