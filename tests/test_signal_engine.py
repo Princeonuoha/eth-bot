@@ -7,6 +7,7 @@ from app.strategy.signal_engine import is_trend_bullish, should_buy, should_sell
 
 # ── is_trend_bullish ──────────────────────────────────────────────────────────
 
+
 def test_trend_bullish_when_above_ema():
     assert is_trend_bullish(current_price=3200.0, ema_200=3000.0) is True
 
@@ -57,6 +58,7 @@ def test_buy_signal_rsi_just_below_threshold():
 
 
 # ── should_sell ───────────────────────────────────────────────────────────────
+
 
 def test_sell_take_profit():
     result = should_sell(

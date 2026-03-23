@@ -1,5 +1,5 @@
-from pydantic_settings import BaseSettings, SettingsConfigDict
 from pydantic import Field
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
@@ -29,11 +29,7 @@ class Settings(BaseSettings):
 
     @property
     def base_url(self) -> str:
-        return (
-            "https://testnet.binance.vision"
-            if self.testnet
-            else "https://api.binance.com"
-        )
+        return "https://testnet.binance.vision" if self.testnet else "https://api.binance.com"
 
 
 settings = Settings()

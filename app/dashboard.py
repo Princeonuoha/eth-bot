@@ -8,11 +8,11 @@ Flask web dashboard with SQLite persistence.
 - Date + time in trade history
 """
 
-import sqlite3
 import json
 import os
+import sqlite3
 from datetime import datetime
-from threading import Thread, Lock
+from threading import Lock, Thread
 
 from flask import Flask, jsonify, render_template_string, request
 from loguru import logger
@@ -49,6 +49,7 @@ _coingecko = CoinGeckoSentiment()
 
 
 # ── SQLite ────────────────────────────────────────────────────────────────────
+
 
 def _init_db():
     with _db_lock:
@@ -98,9 +99,7 @@ def _save_trade(trade: dict):
 def _load_trades() -> list:
     with _db_lock:
         con = sqlite3.connect(DB_PATH)
-        rows = con.execute(
-            "SELECT raw_json FROM trades ORDER BY id DESC LIMIT 200"
-        ).fetchall()
+        rows = con.execute("SELECT raw_json FROM trades ORDER BY id DESC LIMIT 200").fetchall()
         con.close()
     trades = []
     for (raw,) in rows:
@@ -125,6 +124,7 @@ def _compute_daily_pnl(trades: list) -> tuple:
 
 # ── Background refresh ────────────────────────────────────────────────────────
 
+
 def _refresh_loop():
     global _client
     try:
@@ -138,6 +138,7 @@ def _refresh_loop():
         return
 
     import time
+
     while True:
         try:
             price = _client.get_price(settings.symbol)
@@ -173,6 +174,7 @@ def _refresh_loop():
 
 
 # ── Routes ────────────────────────────────────────────────────────────────────
+
 
 @app.route("/")
 def index():

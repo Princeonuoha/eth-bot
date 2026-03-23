@@ -3,9 +3,9 @@ Trader — Main trading loop.
 """
 
 import time
-import requests
-from datetime import datetime, date
+from datetime import date, datetime
 
+import requests
 from loguru import logger
 
 from app.config import settings
@@ -51,8 +51,10 @@ class Trader:
         logger.info("=" * 60)
         logger.info(f"  ETH Bot starting | symbol={settings.symbol}")
         logger.info(f"  Testnet={settings.testnet} | SL={settings.stop_loss_pct}%")
-        logger.info(f"  Trailing: activates at +{settings.trailing_activation_pct}% | "
-                    f"trails by {settings.trailing_stop_pct}% from peak")
+        logger.info(
+            f"  Trailing: activates at +{settings.trailing_activation_pct}% | "
+            f"trails by {settings.trailing_stop_pct}% from peak"
+        )
         logger.info("=" * 60)
         self.notifier.bot_started(settings.testnet)
 
@@ -172,25 +174,29 @@ class Trader:
         self._peak_price = avg_price
 
         event = TradeEvent(
-            symbol=settings.symbol, side="BUY",
-            price=avg_price, quantity=qty, reason="signal"
+            symbol=settings.symbol, side="BUY", price=avg_price, quantity=qty, reason="signal"
         )
         self.trade_log.append(event)
 
         bal_usdc, bal_eth, total_val = self._get_balances()
         self.notifier.trade_opened(
-            settings.symbol, avg_price, qty, usdc_amount,
+            settings.symbol,
+            avg_price,
+            qty,
+            usdc_amount,
             cg_summary=cg_summary,
             balance_usdc=bal_usdc,
             balance_eth=bal_eth,
             total_value=total_val,
         )
-        self._push_to_dashboard({
-            "side": "BUY",
-            "price": avg_price,
-            "quantity": qty,
-            "reason": "signal",
-        })
+        self._push_to_dashboard(
+            {
+                "side": "BUY",
+                "price": avg_price,
+                "quantity": qty,
+                "reason": "signal",
+            }
+        )
 
         logger.info(
             f"Trailing stop: activates at ${avg_price * (1 + settings.trailing_activation_pct / 100):.4f} "
@@ -206,12 +212,15 @@ class Trader:
         order = self.client.place_market_sell(settings.symbol, self.position.quantity)
         avg_price = (
             float(order.get("cummulativeQuoteQty", 0)) / self.position.quantity
-            if self.position.quantity else price
+            if self.position.quantity
+            else price
         )
 
         pnl_usdc = self.position.pnl_usdc(avg_price)
         pnl_pct = self.position.pnl_pct(avg_price)
-        peak_pct = ((self._peak_price - self.position.entry_price) / self.position.entry_price) * 100
+        peak_pct = (
+            (self._peak_price - self.position.entry_price) / self.position.entry_price
+        ) * 100
 
         # Cooldown logic
         if reason == "stop_loss":
@@ -226,8 +235,11 @@ class Trader:
             self._consecutive_stop_losses = 0
 
         event = TradeEvent(
-            symbol=settings.symbol, side="SELL",
-            price=avg_price, quantity=self.position.quantity, reason=reason
+            symbol=settings.symbol,
+            side="SELL",
+            price=avg_price,
+            quantity=self.position.quantity,
+            reason=reason,
         )
         self.trade_log.append(event)
         self.risk.record_trade_result(pnl_usdc)
@@ -235,7 +247,10 @@ class Trader:
         bal_usdc, bal_eth, total_val = self._get_balances()
 
         self.notifier.trade_closed(
-            settings.symbol, reason, pnl_usdc, pnl_pct,
+            settings.symbol,
+            reason,
+            pnl_usdc,
+            pnl_pct,
             daily_pnl=self.risk._daily_pnl_usdc,
             cg_summary=cg_summary,
             balance_usdc=bal_usdc,
@@ -244,16 +259,18 @@ class Trader:
             peak_pct=peak_pct,
         )
 
-        self._push_to_dashboard({
-            "side": "SELL",
-            "price": avg_price,
-            "quantity": self.position.quantity,
-            "reason": reason,
-            "pnl_usdc": round(pnl_usdc, 4),
-            "pnl_pct": round(pnl_pct, 4),
-            "daily_pnl": round(self.risk._daily_pnl_usdc, 4),
-            "peak_pct": round(peak_pct, 4),
-        })
+        self._push_to_dashboard(
+            {
+                "side": "SELL",
+                "price": avg_price,
+                "quantity": self.position.quantity,
+                "reason": reason,
+                "pnl_usdc": round(pnl_usdc, 4),
+                "pnl_pct": round(pnl_pct, 4),
+                "daily_pnl": round(self.risk._daily_pnl_usdc, 4),
+                "peak_pct": round(peak_pct, 4),
+            }
+        )
 
         if self.risk.is_halted:
             self.notifier.daily_halted(

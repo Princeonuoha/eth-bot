@@ -49,6 +49,7 @@ class Notifier:
         total_value: float | None = None,
     ) -> None:
         from datetime import datetime
+
         time_str = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
 
         trailing_activate = price * (1 + settings.trailing_activation_pct / 100)
@@ -72,8 +73,12 @@ class Notifier:
             lines += [
                 "━━━━━━━━━━━━━━━━━━━━",
                 f"💰 USDC left:  <code>${balance_usdc:.2f}</code>",
-                f"🔷 ETH held:   <code>{balance_eth:.5f} ETH</code>" if balance_eth is not None else "",
-                f"📊 Total val:  <code>${total_value:.2f} USDC</code>" if total_value is not None else "",
+                f"🔷 ETH held:   <code>{balance_eth:.5f} ETH</code>"
+                if balance_eth is not None
+                else "",
+                f"📊 Total val:  <code>${total_value:.2f} USDC</code>"
+                if total_value is not None
+                else "",
             ]
             lines = [line for line in lines if line]
 
@@ -99,6 +104,7 @@ class Notifier:
         peak_pct: float | None = None,
     ) -> None:
         from datetime import datetime
+
         time_str = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
 
         emoji = "💰" if pnl_usdc >= 0 else "🔴"
@@ -130,8 +136,12 @@ class Notifier:
             lines += [
                 "━━━━━━━━━━━━━━━━━━━━",
                 f"💰 USDC bal:   <code>${balance_usdc:.2f}</code>",
-                f"🔷 ETH held:   <code>{balance_eth:.5f} ETH</code>" if balance_eth is not None else "",
-                f"📊 Total val:  <code>${total_value:.2f} USDC</code>" if total_value is not None else "",
+                f"🔷 ETH held:   <code>{balance_eth:.5f} ETH</code>"
+                if balance_eth is not None
+                else "",
+                f"📊 Total val:  <code>${total_value:.2f} USDC</code>"
+                if total_value is not None
+                else "",
             ]
             lines = [line for line in lines if line]
 
@@ -150,6 +160,7 @@ class Notifier:
         total_value: float | None = None,
     ) -> None:
         from datetime import datetime
+
         date_str = datetime.utcnow().strftime("%Y-%m-%d")
 
         lines = [

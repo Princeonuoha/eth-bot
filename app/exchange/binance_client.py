@@ -49,9 +49,18 @@ class BinanceClient:
             df = pd.DataFrame(
                 raw,
                 columns=[
-                    "open_time", "open", "high", "low", "close", "volume",
-                    "close_time", "quote_volume", "trades",
-                    "taker_base", "taker_quote", "ignore",
+                    "open_time",
+                    "open",
+                    "high",
+                    "low",
+                    "close",
+                    "volume",
+                    "close_time",
+                    "quote_volume",
+                    "trades",
+                    "taker_base",
+                    "taker_quote",
+                    "ignore",
                 ],
             )
             for col in ["open", "high", "low", "close", "volume"]:

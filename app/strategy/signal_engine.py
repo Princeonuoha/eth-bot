@@ -56,9 +56,7 @@ def should_buy(
         )
         return False
 
-    logger.info(
-        f"Signal: BUY ✅ | RSI={rsi:.1f} | pullback={pullback_pct:.2f}% | trend_ok=True"
-    )
+    logger.info(f"Signal: BUY ✅ | RSI={rsi:.1f} | pullback={pullback_pct:.2f}% | trend_ok=True")
     return True
 
 
