@@ -1,23 +1,18 @@
 """
 Dashboard
 ─────────
-Lightweight Flask web dashboard with SQLite persistence.
+Flask web dashboard with SQLite persistence.
 - All trades saved to trades.db — survives restarts
-- Live USDC + ETH balance display
-- Open position tracking
-- CoinGecko sentiment
-
-Run alongside the bot:
-  python -m app.dashboard
-
-Then open: http://localhost:5000
+- Live USDC + ETH balance
+- Open position with trailing stop tracker
+- Date + time in trade history
 """
 
+import sqlite3
 import json
 import os
-import sqlite3
 from datetime import datetime
-from threading import Lock, Thread
+from threading import Thread, Lock
 
 from flask import Flask, jsonify, render_template_string, request
 from loguru import logger
@@ -31,7 +26,6 @@ app = Flask(__name__)
 DB_PATH = os.path.join(os.path.dirname(__file__), "..", "trades.db")
 _db_lock = Lock()
 
-# ── Shared state ──────────────────────────────────────────────────────────────
 _state = {
     "price": 0.0,
     "price_updated": None,
@@ -45,6 +39,9 @@ _state = {
     "balance_usdc": 0.0,
     "balance_eth": 0.0,
     "total_value_usdc": 0.0,
+    "trailing_activation_pct": 1.0,
+    "trailing_stop_pct": 0.8,
+    "stop_loss_pct": 1.5,
 }
 
 _client = None
@@ -133,6 +130,9 @@ def _refresh_loop():
     try:
         _client = BinanceClient()
         _state["bot_running"] = True
+        _state["trailing_activation_pct"] = settings.trailing_activation_pct
+        _state["trailing_stop_pct"] = settings.trailing_stop_pct
+        _state["stop_loss_pct"] = settings.stop_loss_pct
     except Exception as e:
         _state["last_error"] = str(e)
         return
@@ -144,18 +144,18 @@ def _refresh_loop():
             _state["price"] = price
             _state["price_updated"] = datetime.utcnow().strftime("%H:%M:%S UTC")
 
-            # Live balances from Binance
             usdc = _client.get_balance("USDC")
             eth = _client.get_balance("ETH")
             _state["balance_usdc"] = round(usdc, 2)
             _state["balance_eth"] = round(eth, 6)
             _state["total_value_usdc"] = round(usdc + eth * price, 2)
 
-            # Keep unrealised PnL live on open position
+            # Keep position current price live + update peak
             if _state["position"]:
                 _state["position"]["current_price"] = price
+                if price > _state["position"].get("peak_price", 0):
+                    _state["position"]["peak_price"] = price
 
-            # Sentiment
             cg = _coingecko.get_sentiment()
             if cg:
                 _state["sentiment"] = {
@@ -189,23 +189,19 @@ def add_trade():
     trade = request.json
     trade["timestamp"] = datetime.utcnow().isoformat()
 
-    # Persist to SQLite — survives restarts
     _save_trade(trade)
 
-    # Update in-memory list
     _state["trades"].insert(0, trade)
     _state["trades"] = _state["trades"][:200]
-
-    # Recompute daily stats
     _state["daily_pnl"], _state["daily_trades"] = _compute_daily_pnl(_state["trades"])
 
-    # Track open position
     if trade["side"] == "BUY":
         _state["position"] = {
             "entry_price": trade["price"],
             "quantity": trade["quantity"],
             "entry_time": trade["timestamp"],
             "current_price": _state["price"] or trade["price"],
+            "peak_price": _state["price"] or trade["price"],
         }
     elif trade["side"] == "SELL":
         _state["position"] = None
@@ -238,6 +234,7 @@ DASHBOARD_HTML = """
   .card-sub { font-size: 12px; color: #64748b; margin-top: 4px; }
   .positive { color: #22c55e; }
   .negative { color: #ef4444; }
+  .warning { color: #f59e0b; }
   .balance-card { background: #0f1f17; border: 1px solid #166534; border-radius: 12px; padding: 16px 20px; }
   .balance-total { font-size: 24px; font-weight: 700; color: #22c55e; }
   .badge { display: inline-block; padding: 3px 10px; border-radius: 20px; font-size: 11px; font-weight: 600; text-transform: uppercase; }
@@ -252,11 +249,24 @@ DASHBOARD_HTML = """
   tr:last-child td { border-bottom: none; }
   .side-buy { color: #22c55e; font-weight: 600; }
   .side-sell { color: #f97316; font-weight: 600; }
+  .reason-trailing { color: #a78bfa; }
+  .reason-stoploss { color: #ef4444; }
+  .reason-tp { color: #22c55e; }
   .chart-wrap { position: relative; height: 200px; }
   .section-title { font-size: 13px; font-weight: 600; color: #94a3b8; margin-bottom: 12px; text-transform: uppercase; letter-spacing: 0.05em; }
-  .position-card { background: #0f2a1a; border: 1px solid #166534; border-radius: 12px; padding: 16px 20px; margin-bottom: 14px; }
+  .position-card { background: #0f2a1a; border: 1px solid #166534; border-radius: 12px; padding: 18px 20px; margin-bottom: 14px; }
   .no-position { background: #1e2130; border: 1px dashed #2d3148; border-radius: 12px; padding: 14px 20px; margin-bottom: 14px; text-align: center; color: #475569; font-size: 13px; }
+  .trail-bar-wrap { margin-top: 14px; }
+  .trail-bar-label { display: flex; justify-content: space-between; font-size: 11px; color: #64748b; margin-bottom: 5px; }
+  .trail-bar-bg { height: 8px; border-radius: 4px; background: #1a1f35; position: relative; overflow: visible; }
+  .trail-bar-fill { height: 100%; border-radius: 4px; transition: width 0.5s ease; }
+  .trail-marker { position: absolute; top: -4px; width: 2px; height: 16px; background: #f59e0b; border-radius: 1px; }
   .updated { font-size: 11px; color: #475569; margin-top: 2px; }
+  .pos-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 14px; margin-bottom: 14px; }
+  .pos-grid-bottom { display: grid; grid-template-columns: repeat(4, 1fr); gap: 14px; }
+  .pos-stat { }
+  .pos-stat-label { font-size: 11px; color: #64748b; margin-bottom: 3px; }
+  .pos-stat-value { font-size: 15px; font-weight: 600; color: #f8fafc; }
 </style>
 </head>
 <body>
@@ -326,9 +336,9 @@ DASHBOARD_HTML = """
   <div class="section-title">Trade History</div>
   <table>
     <thead><tr>
-      <th>Time</th><th>Side</th><th>Price</th><th>Qty (ETH)</th><th>Spent/Received</th><th>Trade PnL</th><th>Day PnL</th><th>Reason</th>
+      <th>Date / Time</th><th>Side</th><th>Price</th><th>Qty (ETH)</th><th>Spent/Received</th><th>Trade PnL</th><th>Peak</th><th>Day PnL</th><th>Reason</th>
     </tr></thead>
-    <tbody id="trade-tbody"><tr><td colspan="8" style="color:#475569;text-align:center;">No trades yet</td></tr></tbody>
+    <tbody id="trade-tbody"><tr><td colspan="9" style="color:#475569;text-align:center;">No trades yet</td></tr></tbody>
   </table>
 </div>
 
@@ -344,12 +354,31 @@ function initChart() {
     }
   });
 }
-function fmtTime(iso) { return iso ? iso.slice(11,16)+' UTC' : '—'; }
+
+function fmtDateTime(iso) {
+  if (!iso) return '—';
+  const date = iso.slice(0, 10);
+  const time = iso.slice(11, 16);
+  return `<span style="color:#94a3b8;">${date}</span> ${time} UTC`;
+}
+
 function fmtPnl(v) {
   if (v == null) return '—';
   const cls = v >= 0 ? 'positive' : 'negative';
   return `<span class="${cls}">${v>=0?'+':''}$${Math.abs(parseFloat(v)).toFixed(2)}</span>`;
 }
+
+function fmtReason(r) {
+  if (!r) return '—';
+  const map = {
+    'trailing_stop': '<span class="reason-trailing">🎯 Trail Stop</span>',
+    'stop_loss':     '<span class="reason-stoploss">🛑 Stop Loss</span>',
+    'take_profit':   '<span class="reason-tp">✅ Take Profit</span>',
+    'signal':        '<span style="color:#64748b;">Signal</span>',
+  };
+  return map[r] || `<span style="color:#64748b;">${r}</span>`;
+}
+
 function updateSentiment(s) {
   if (!s) { document.getElementById('sentiment-content').innerHTML = '<div style="color:#475569;font-size:13px;">Unavailable</div>'; return; }
   const fc = s.label==='bullish'?'#22c55e':s.label==='bearish'?'#ef4444':'#64748b';
@@ -365,23 +394,113 @@ function updateSentiment(s) {
       <div style="text-align:center;"><div style="font-size:11px;color:#475569;margin-bottom:2px;">7D</div><div style="font-size:15px;font-weight:600;" class="${s.change_7d>=0?'positive':'negative'}">${s.change_7d>=0?'+':''}${parseFloat(s.change_7d).toFixed(2)}%</div></div>
     </div>`;
 }
-function updatePosition(pos, price) {
+
+function updatePosition(pos, price, s) {
   const el = document.getElementById('position-section');
-  if (!pos) { el.innerHTML = '<div class="no-position">No open position — bot is watching for signals</div>'; return; }
+  if (!pos) {
+    el.innerHTML = '<div class="no-position">No open position — bot is watching for signals 👁</div>';
+    return;
+  }
+
   const cp = pos.current_price || price || pos.entry_price;
-  const pnlPct = ((cp - pos.entry_price) / pos.entry_price * 100).toFixed(2);
-  const pnlUsdc = ((cp - pos.entry_price) * pos.quantity).toFixed(2);
-  const cls = pnlPct >= 0 ? 'positive' : 'negative';
-  el.innerHTML = `<div class="position-card">
-    <div class="section-title" style="color:#22c55e;">⚡ Open Position</div>
-    <div style="display:grid;grid-template-columns:repeat(5,1fr);gap:16px;margin-top:8px;">
-      <div><div style="font-size:11px;color:#64748b;margin-bottom:3px;">Entry Price</div><div style="font-weight:600;">$${parseFloat(pos.entry_price).toFixed(4)}</div></div>
-      <div><div style="font-size:11px;color:#64748b;margin-bottom:3px;">Current Price</div><div style="font-weight:600;">$${parseFloat(cp).toFixed(4)}</div></div>
-      <div><div style="font-size:11px;color:#64748b;margin-bottom:3px;">Quantity</div><div style="font-weight:600;">${parseFloat(pos.quantity).toFixed(5)} ETH</div></div>
-      <div><div style="font-size:11px;color:#64748b;margin-bottom:3px;">Unrealised PnL</div><div style="font-weight:600;" class="${cls}">${pnlPct>=0?'+':''}$${pnlUsdc} (${pnlPct}%)</div></div>
-      <div><div style="font-size:11px;color:#64748b;margin-bottom:3px;">Opened</div><div style="font-weight:600;">${fmtTime(pos.entry_time)}</div></div>
-    </div></div>`;
+  const peak = pos.peak_price || cp;
+  const entry = pos.entry_price;
+
+  const pnlPct = ((cp - entry) / entry * 100);
+  const pnlUsdc = ((cp - entry) * pos.quantity);
+  const peakPct = ((peak - entry) / entry * 100);
+  const pnlCls = pnlPct >= 0 ? 'positive' : 'negative';
+
+  // Trailing stop settings from state
+  const activationPct = s.trailing_activation_pct || 1.0;
+  const trailPct = s.trailing_stop_pct || 0.8;
+  const hardStopPct = s.stop_loss_pct || 1.5;
+
+  const activationPrice = entry * (1 + activationPct / 100);
+  const trailActive = peakPct >= activationPct;
+  const trailStopLevel = peak * (1 - trailPct / 100);
+  const hardStopLevel = entry * (1 - hardStopPct / 100);
+
+  // Progress bar: from hard stop (-hardStopPct%) to peak
+  const barMin = entry * (1 - hardStopPct / 100);
+  const barMax = Math.max(peak * 1.005, activationPrice * 1.01);
+  const barRange = barMax - barMin;
+  const currentPct = Math.max(0, Math.min(100, (cp - barMin) / barRange * 100));
+  const trailLevelPct = Math.max(0, Math.min(100, (trailStopLevel - barMin) / barRange * 100));
+  const activationPctBar = Math.max(0, Math.min(100, (activationPrice - barMin) / barRange * 100));
+
+  const barColor = trailActive ? '#22c55e' : '#3b82f6';
+
+  el.innerHTML = `
+    <div class="position-card">
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;">
+        <div class="section-title" style="color:#22c55e;margin-bottom:0;">⚡ Open Position</div>
+        <div style="display:flex;gap:8px;align-items:center;">
+          ${trailActive
+            ? '<span style="background:#14532d;color:#22c55e;padding:3px 10px;border-radius:20px;font-size:11px;font-weight:600;">🎯 TRAILING ACTIVE</span>'
+            : `<span style="background:#1e3a5f;color:#60a5fa;padding:3px 10px;border-radius:20px;font-size:11px;font-weight:600;">⏳ WAITING FOR +${activationPct}%</span>`
+          }
+        </div>
+      </div>
+
+      <div class="pos-grid">
+        <div class="pos-stat">
+          <div class="pos-stat-label">Entry Price</div>
+          <div class="pos-stat-value">$${parseFloat(entry).toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:4})}</div>
+        </div>
+        <div class="pos-stat">
+          <div class="pos-stat-label">Current Price</div>
+          <div class="pos-stat-value">$${parseFloat(cp).toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:4})}</div>
+        </div>
+        <div class="pos-stat">
+          <div class="pos-stat-label">Unrealised PnL</div>
+          <div class="pos-stat-value ${pnlCls}">${pnlPct>=0?'+':''}$${Math.abs(pnlUsdc).toFixed(2)} (${pnlPct.toFixed(2)}%)</div>
+        </div>
+        <div class="pos-stat">
+          <div class="pos-stat-label">Quantity</div>
+          <div class="pos-stat-value">${parseFloat(pos.quantity).toFixed(5)} ETH</div>
+        </div>
+      </div>
+
+      <div class="pos-grid-bottom">
+        <div class="pos-stat">
+          <div class="pos-stat-label">🏔 Peak Price</div>
+          <div class="pos-stat-value" style="color:#f59e0b;">$${parseFloat(peak).toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:4})} (+${peakPct.toFixed(2)}%)</div>
+        </div>
+        <div class="pos-stat">
+          <div class="pos-stat-label">${trailActive ? '🎯 Trail Stop Level' : '🎯 Trail Activates At'}</div>
+          <div class="pos-stat-value" style="color:#a78bfa;">$${trailActive ? trailStopLevel.toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:4}) : activationPrice.toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:4})}</div>
+        </div>
+        <div class="pos-stat">
+          <div class="pos-stat-label">🛑 Hard Stop Level</div>
+          <div class="pos-stat-value" style="color:#ef4444;">$${hardStopLevel.toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:4})}</div>
+        </div>
+        <div class="pos-stat">
+          <div class="pos-stat-label">Opened</div>
+          <div class="pos-stat-value" style="font-size:13px;">${pos.entry_time ? pos.entry_time.slice(0,10)+' '+pos.entry_time.slice(11,16)+' UTC' : '—'}</div>
+        </div>
+      </div>
+
+      <div class="trail-bar-wrap">
+        <div class="trail-bar-label">
+          <span style="color:#ef4444;">🛑 $${hardStopLevel.toFixed(2)}</span>
+          <span style="color:#94a3b8;">Price Range</span>
+          <span style="color:#f59e0b;">🏔 $${peak.toFixed(2)}</span>
+        </div>
+        <div class="trail-bar-bg">
+          <div class="trail-bar-fill" style="width:${currentPct}%;background:${barColor};"></div>
+          ${trailActive ? `<div class="trail-marker" style="left:${trailLevelPct}%;" title="Trail stop: $${trailStopLevel.toFixed(2)}"></div>` : `<div class="trail-marker" style="left:${activationPctBar}%;background:#3b82f6;" title="Trail activates: $${activationPrice.toFixed(2)}"></div>`}
+        </div>
+        <div style="font-size:11px;color:#64748b;margin-top:5px;text-align:center;">
+          ${trailActive
+            ? `Trail stop at $${trailStopLevel.toFixed(2)} — drops ${trailPct}% below peak — locking in ${Math.max(0,((trailStopLevel-entry)/entry*100)).toFixed(2)}%`
+            : `Trailing activates when price reaches $${activationPrice.toFixed(2)} (+${activationPct}%)`
+          }
+        </div>
+      </div>
+    </div>`;
 }
+
 function updateTrades(trades) {
   const sells = trades.filter(t => t.side === 'SELL');
   document.getElementById('total-trades').textContent = sells.length;
@@ -389,32 +508,41 @@ function updateTrades(trades) {
   if (!trades.length) return;
   tbody.innerHTML = trades.map(t => {
     const val = (t.price * t.quantity).toFixed(2);
-    const spent = t.side==='BUY' ? `<span style="color:#ef4444;">-$${val}</span>` : `<span style="color:#22c55e;">+$${val}</span>`;
+    const spent = t.side==='BUY'
+      ? `<span style="color:#ef4444;">-$${val}</span>`
+      : `<span style="color:#22c55e;">+$${val}</span>`;
+    const peakCol = t.peak_pct != null
+      ? `<span style="color:#f59e0b;">+${parseFloat(t.peak_pct).toFixed(2)}%</span>`
+      : '—';
     return `<tr>
-      <td>${fmtTime(t.timestamp)}</td>
+      <td>${fmtDateTime(t.timestamp)}</td>
       <td class="side-${t.side.toLowerCase()}">${t.side}</td>
       <td>$${parseFloat(t.price).toFixed(4)}</td>
       <td>${parseFloat(t.quantity).toFixed(5)}</td>
       <td>${spent}</td>
       <td>${t.pnl_usdc!=null?fmtPnl(t.pnl_usdc):'—'}</td>
+      <td>${peakCol}</td>
       <td>${t.daily_pnl!=null?fmtPnl(t.daily_pnl):'—'}</td>
-      <td style="color:#64748b;">${t.reason||'—'}</td>
+      <td>${fmtReason(t.reason)}</td>
     </tr>`;
   }).join('');
-  // Chart
+
   const sorted = [...sells].reverse();
   let running = 0;
-  const labels = sorted.map(t => fmtTime(t.timestamp));
+  const labels = sorted.map(t => t.timestamp ? t.timestamp.slice(0,10)+' '+t.timestamp.slice(11,16) : '');
   const values = sorted.map(t => { running += (t.pnl_usdc||0); return parseFloat(running.toFixed(2)); });
   if (pnlChart) { pnlChart.data.labels=labels; pnlChart.data.datasets[0].data=values; pnlChart.update(); }
 }
+
 async function refresh() {
   try {
     const res = await fetch('/api/state');
     const s = await res.json();
     const price = parseFloat(s.price);
+
     document.getElementById('price').textContent = price ? '$'+price.toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2}) : '—';
     document.getElementById('price-updated').textContent = s.price_updated || '—';
+
     const usdc = parseFloat(s.balance_usdc||0);
     const eth = parseFloat(s.balance_eth||0);
     const total = parseFloat(s.total_value_usdc||0);
@@ -423,23 +551,30 @@ async function refresh() {
     document.getElementById('balance-usdc').textContent = '$'+usdc.toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2});
     document.getElementById('balance-eth').textContent = eth.toFixed(5)+' ETH';
     document.getElementById('eth-value-usdc').textContent = '≈ $'+(eth*price).toFixed(2);
+
     const pnl = parseFloat(s.daily_pnl||0);
     const pnlEl = document.getElementById('daily-pnl');
     pnlEl.textContent = (pnl>=0?'+':'')+' $'+Math.abs(pnl).toFixed(2);
     pnlEl.className = 'card-value '+(pnl>0?'positive':pnl<0?'negative':'');
     document.getElementById('daily-trades').textContent = (s.daily_trades||0)+' trades today';
+
     const lossUsed = Math.abs(Math.min(0,pnl));
     const limitEl = document.getElementById('limit-used');
     limitEl.textContent = '-$'+lossUsed.toFixed(2);
     limitEl.className = 'card-value '+(lossUsed>0?'negative':'');
-    document.getElementById('limit-pct').textContent = (lossUsed/80*100).toFixed(0)+'% of daily limit';
-    document.getElementById('bot-status').innerHTML = s.bot_running ? '<span class="positive">Running ✓</span>' : '<span class="negative">Offline</span>';
+    document.getElementById('limit-pct').textContent = (lossUsed/(s.daily_loss_limit||80)*100).toFixed(0)+'% of daily limit';
+
+    document.getElementById('bot-status').innerHTML = s.bot_running
+      ? '<span class="positive">Running ✓</span>'
+      : '<span class="negative">Offline</span>';
     document.getElementById('last-error').textContent = s.last_error || '';
+
     updateSentiment(s.sentiment);
-    updatePosition(s.position, price);
+    updatePosition(s.position, price, s);
     updateTrades(s.trades||[]);
   } catch(e) { console.error(e); }
 }
+
 initChart(); refresh(); setInterval(refresh, 10000);
 </script>
 </body>
@@ -449,7 +584,6 @@ initChart(); refresh(); setInterval(refresh, 10000);
 
 def start():
     _init_db()
-    # Restore trades from DB on every startup
     trades = _load_trades()
     _state["trades"] = trades
     _state["daily_pnl"], _state["daily_trades"] = _compute_daily_pnl(trades)

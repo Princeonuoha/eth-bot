@@ -1,5 +1,5 @@
-from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic import Field
 
 
 class Settings(BaseSettings):
@@ -13,12 +13,15 @@ class Settings(BaseSettings):
     # Strategy
     symbol: str = Field(default="ETHUSDC")
     trade_amount_usdc: float = Field(default=100.0)
-    take_profit_pct: float = Field(default=1.0)
-    stop_loss_pct: float = Field(default=0.7)
+    stop_loss_pct: float = Field(default=1.5)
     daily_loss_limit_usdc: float = Field(default=30.0)
     rsi_oversold: float = Field(default=38.0)
     pullback_min_pct: float = Field(default=0.8)
     loop_interval_seconds: int = Field(default=30)
+
+    # Trailing stop
+    trailing_activation_pct: float = Field(default=1.0)
+    trailing_stop_pct: float = Field(default=0.8)
 
     # Notifications
     telegram_bot_token: str = Field(default="")
