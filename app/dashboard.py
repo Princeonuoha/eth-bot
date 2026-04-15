@@ -238,7 +238,7 @@ def api_state():
 @app.route("/health")
 def health():
     import time as _time
-    now = _time.time()
+    _ = _time.time()
     price_age = None
     if _state.get("price_updated"):
         try:

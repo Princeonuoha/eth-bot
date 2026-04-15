@@ -218,7 +218,7 @@ def run(
         pullback = float(row["pullback"]) if not pd.isna(row["pullback"]) else 0.0
         vol_ratio = float(row["vol_ratio"]) if not pd.isna(row["vol_ratio"]) else 1.0
         atr_pct = float(row["atr_pct"]) if not pd.isna(row["atr_pct"]) else 0.0
-        squeeze = bool(row["squeeze"]) if not pd.isna(row["squeeze"]) else False
+        _ = bool(row["squeeze"]) if not pd.isna(row["squeeze"]) else False
 
         trend_ok = price > ema_200
         ema_50_above_200 = ema_50 > ema_200
