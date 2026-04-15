@@ -1,14 +1,56 @@
 version: "3.9"
 
+# ── Volumes ───────────────────────────────────────────────────────────────────
+# Named volumes survive container restarts, rebuilds, and reboots.
+# data/ → trades.db + position DB (position_store.py writes here)
+# logs/ → rotating log files from both services
+volumes:
+  data:
+  logs:
+
+# ── Services ──────────────────────────────────────────────────────────────────
 services:
+
+  # Flask dashboard — starts first, bot depends on it
+  dashboard:
+    build: .
+    container_name: eth-dashboard
+    restart: always                  # always restart — even after EC2 reboot
+    command: python -m app.dashboard
+    env_file:
+      - .env
+    ports:
+      - "5000:5000"
+    volumes:
+      - data:/app/data               # trades.db lives here
+      - logs:/app/logs
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:5000/health')"]
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      retries: 3
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+  # Trading bot — waits for dashboard to be healthy before starting
   eth-bot:
     build: .
     container_name: eth-bot
-    restart: unless-stopped
+    restart: always                  # auto-restarts within 60s if it crashes
     env_file:
       - .env
+    environment:
+      - DB_PATH=/app/data/trades.db  # point to persistent volume
     volumes:
-      - ./logs:/app/logs
+      - data:/app/data               # trades.db + position_store DB
+      - logs:/app/logs
+    depends_on:
+      dashboard:
+        condition: service_healthy   # don't start until dashboard is ready
     logging:
       driver: "json-file"
       options:

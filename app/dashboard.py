@@ -5,12 +5,14 @@ Flask web dashboard with SQLite persistence.
 - All trades saved to trades.db — survives restarts
 - Live USDC + ETH balance
 - Open position with trailing stop tracker
+- Signal log — last 10 ticks with all indicator values
 - Date + time in trade history
 """
 
 import json
 import os
 import sqlite3
+from collections import deque
 from datetime import datetime
 from threading import Lock, Thread
 
@@ -23,7 +25,7 @@ from app.services.coingecko import CoinGeckoSentiment
 
 app = Flask(__name__)
 
-DB_PATH = os.path.join(os.path.dirname(__file__), "..", "trades.db")
+DB_PATH = os.environ.get("DB_PATH", "/app/data/trades.db")
 _db_lock = Lock()
 
 _state = {
@@ -43,6 +45,9 @@ _state = {
     "trailing_stop_pct": 0.8,
     "stop_loss_pct": 1.5,
 }
+
+# Signal log — last 10 ticks
+_signal_log: deque = deque(maxlen=10)
 
 _client = None
 _coingecko = CoinGeckoSentiment()
@@ -97,16 +102,42 @@ def _save_trade(trade: dict):
 
 
 def _load_trades() -> list:
-    with _db_lock:
-        con = sqlite3.connect(DB_PATH)
-        rows = con.execute("SELECT raw_json FROM trades ORDER BY id DESC LIMIT 200").fetchall()
-        con.close()
+    db = os.environ.get("DB_PATH", "/app/data/trades.db")
+    con = sqlite3.connect(db)
+    rows = con.execute("SELECT raw_json FROM trades ORDER BY id DESC LIMIT 200").fetchall()
     trades = []
     for (raw,) in rows:
-        try:
-            trades.append(json.loads(raw))
-        except Exception:
-            pass
+        trades.append(json.loads(raw))
+
+    # Prepend open BUY if one exists (deduped)
+    try:
+        row = con.execute("SELECT * FROM open_position LIMIT 1").fetchone()
+        cols = [c[1] for c in con.execute("PRAGMA table_info(open_position)").fetchall()]
+        if row:
+            pos = dict(zip(cols, row))
+            already_present = (
+                trades and
+                trades[0].get("side") == "BUY" and
+                abs(trades[0].get("price", 0) - pos["entry_price"]) < 0.01
+            )
+            if not already_present:
+                open_trade = {
+                    "side": "BUY",
+                    "price": pos["entry_price"],
+                    "quantity": pos["quantity"],
+                    "reason": "signal",
+                    "timestamp": pos["entry_time"],
+                    "pnl_usdc": None,
+                    "pnl_pct": None,
+                    "daily_pnl": None,
+                    "peak_pct": None,
+                    "daily_trades": None,
+                }
+                trades.insert(0, open_trade)
+    except Exception:
+        pass
+
+    con.close()
     return trades
 
 
@@ -151,7 +182,6 @@ def _refresh_loop():
             _state["balance_eth"] = round(eth, 6)
             _state["total_value_usdc"] = round(usdc + eth * price, 2)
 
-            # Keep position current price live + update peak
             if _state["position"]:
                 _state["position"]["current_price"] = price
                 if price > _state["position"].get("peak_price", 0):
@@ -183,7 +213,56 @@ def index():
 
 @app.route("/api/state")
 def api_state():
-    return jsonify(_state)
+    import sqlite3 as _sqlite3
+    state = dict(_state)
+    try:
+        db = os.environ.get("DB_PATH", "/app/data/trades.db")
+        con = _sqlite3.connect(db)
+        row = con.execute("SELECT * FROM open_position LIMIT 1").fetchone()
+        cols = [c[1] for c in con.execute("PRAGMA table_info(open_position)").fetchall()]
+        con.close()
+        if row:
+            pos = dict(zip(cols, row))
+            pos["current_price"] = state.get("price") or pos["entry_price"]
+            pos["peak_price"] = pos.get("peak_price") or pos["current_price"]
+            state["position"] = pos
+        else:
+            state["position"] = None
+    except Exception:
+        state["position"] = None
+    # Include signal log
+    state["signal_log"] = list(_signal_log)
+    return jsonify(state)
+
+
+@app.route("/health")
+def health():
+    import time as _time
+    now = _time.time()
+    price_age = None
+    if _state.get("price_updated"):
+        try:
+            last = datetime.strptime(_state["price_updated"], "%H:%M:%S UTC").replace(
+                year=datetime.utcnow().year,
+                month=datetime.utcnow().month,
+                day=datetime.utcnow().day,
+            )
+            price_age = round((datetime.utcnow() - last).total_seconds(), 1)
+        except Exception:
+            price_age = None
+
+    price_fresh = price_age is not None and price_age < 60
+    healthy = _state.get("bot_running", False) and price_fresh
+
+    payload = {
+        "status": "ok" if healthy else "degraded",
+        "last_price": _state.get("price"),
+        "price_age_s": price_age,
+        "bot_running": _state.get("bot_running", False),
+        "last_error": _state.get("last_error"),
+        "position": "open" if _state.get("position") else "none",
+    }
+    return jsonify(payload), (200 if healthy else 503)
 
 
 @app.route("/api/trade", methods=["POST"])
@@ -208,6 +287,14 @@ def add_trade():
     elif trade["side"] == "SELL":
         _state["position"] = None
 
+    return jsonify({"ok": True})
+
+
+@app.route("/api/signal", methods=["POST"])
+def add_signal():
+    """Receives indicator snapshot from bot every tick. Keeps last 10."""
+    signal = request.json
+    _signal_log.appendleft(signal)
     return jsonify({"ok": True})
 
 
@@ -254,6 +341,7 @@ DASHBOARD_HTML = """
   .reason-trailing { color: #a78bfa; }
   .reason-stoploss { color: #ef4444; }
   .reason-tp { color: #22c55e; }
+  .reason-partial { color: #60a5fa; }
   .chart-wrap { position: relative; height: 200px; }
   .section-title { font-size: 13px; font-weight: 600; color: #94a3b8; margin-bottom: 12px; text-transform: uppercase; letter-spacing: 0.05em; }
   .position-card { background: #0f2a1a; border: 1px solid #166534; border-radius: 12px; padding: 18px 20px; margin-bottom: 14px; }
@@ -266,9 +354,17 @@ DASHBOARD_HTML = """
   .updated { font-size: 11px; color: #475569; margin-top: 2px; }
   .pos-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 14px; margin-bottom: 14px; }
   .pos-grid-bottom { display: grid; grid-template-columns: repeat(4, 1fr); gap: 14px; }
-  .pos-stat { }
   .pos-stat-label { font-size: 11px; color: #64748b; margin-bottom: 3px; }
   .pos-stat-value { font-size: 15px; font-weight: 600; color: #f8fafc; }
+  /* Signal log */
+  .signal-table { width: 100%; border-collapse: collapse; font-size: 11px; font-family: 'SF Mono', 'Fira Code', monospace; }
+  .signal-table th { padding: 6px 8px; color: #475569; font-weight: 500; border-bottom: 1px solid #2d3148; text-align: center; }
+  .signal-table td { padding: 5px 8px; border-bottom: 1px solid #1a1f35; text-align: center; color: #94a3b8; }
+  .signal-table tr:first-child td { color: #e2e8f0; background: #161b2e; }
+  .sig-ok { color: #22c55e; }
+  .sig-warn { color: #ef4444; }
+  .sig-neutral { color: #64748b; }
+  .sig-active { color: #f59e0b; }
 </style>
 </head>
 <body>
@@ -334,6 +430,32 @@ DASHBOARD_HTML = """
   </div>
 </div>
 
+<!-- Signal Log -->
+<div class="card" style="margin-bottom:14px;">
+  <div class="section-title">Signal Log — Last 10 Ticks</div>
+  <div style="overflow-x:auto;">
+    <table class="signal-table">
+      <thead><tr>
+        <th>Time</th>
+        <th>Price</th>
+        <th>15m RSI</th>
+        <th>1h RSI</th>
+        <th>EMA Slope</th>
+        <th>Pullback</th>
+        <th>Vol Ratio</th>
+        <th>ATR%</th>
+        <th>Trend</th>
+        <th>50>200</th>
+        <th>Squeeze</th>
+        <th>Sentiment</th>
+        <th>Position</th>
+        <th>PnL%</th>
+      </tr></thead>
+      <tbody id="signal-tbody"><tr><td colspan="14" style="color:#475569;text-align:center;padding:12px;">Waiting for ticks...</td></tr></tbody>
+    </table>
+  </div>
+</div>
+
 <div class="card">
   <div class="section-title">Trade History</div>
   <table>
@@ -373,10 +495,11 @@ function fmtPnl(v) {
 function fmtReason(r) {
   if (!r) return '—';
   const map = {
-    'trailing_stop': '<span class="reason-trailing">🎯 Trail Stop</span>',
-    'stop_loss':     '<span class="reason-stoploss">🛑 Stop Loss</span>',
-    'take_profit':   '<span class="reason-tp">✅ Take Profit</span>',
-    'signal':        '<span style="color:#64748b;">Signal</span>',
+    'trailing_stop':        '<span class="reason-trailing">🎯 Trail Stop</span>',
+    'stop_loss':            '<span class="reason-stoploss">🛑 Stop Loss</span>',
+    'take_profit':          '<span class="reason-tp">✅ Take Profit</span>',
+    'partial_take_profit':  '<span class="reason-partial">💰 Partial TP</span>',
+    'signal':               '<span style="color:#64748b;">Signal</span>',
   };
   return map[r] || `<span style="color:#64748b;">${r}</span>`;
 }
@@ -397,6 +520,40 @@ function updateSentiment(s) {
     </div>`;
 }
 
+function updateSignalLog(signals) {
+  const tbody = document.getElementById('signal-tbody');
+  if (!signals || !signals.length) return;
+  tbody.innerHTML = signals.map((s, i) => {
+    const rsiCls = s.rsi_15m < 40 ? 'sig-ok' : s.rsi_15m > 60 ? 'sig-warn' : 'sig-neutral';
+    const rsi1hCls = s.rsi_1h > 45 ? 'sig-ok' : 'sig-warn';
+    const trendCls = s.trend ? 'sig-ok' : 'sig-warn';
+    const crossCls = s.ema_cross ? 'sig-ok' : 'sig-warn';
+    const slopeCls = s.ema_slope > 0 ? 'sig-ok' : 'sig-warn';
+    const squeezeStr = s.squeeze ? '<span class="sig-active">🔥</span>' : '<span class="sig-neutral">—</span>';
+    const sentCls = s.sentiment === 'bullish' ? 'sig-ok' : s.sentiment === 'bearish' ? 'sig-warn' : 'sig-neutral';
+    const posCls = s.position ? 'sig-active' : 'sig-neutral';
+    const pnlStr = s.pnl_pct != null
+      ? `<span class="${s.pnl_pct >= 0 ? 'sig-ok' : 'sig-warn'}">${s.pnl_pct >= 0 ? '+' : ''}${s.pnl_pct}%</span>`
+      : '<span class="sig-neutral">—</span>';
+    return `<tr>
+      <td>${s.timestamp || '—'}</td>
+      <td>$${s.price}</td>
+      <td class="${rsiCls}">${s.rsi_15m}</td>
+      <td class="${rsi1hCls}">${s.rsi_1h}</td>
+      <td class="${slopeCls}">${s.ema_slope > 0 ? '+' : ''}${s.ema_slope}%</td>
+      <td>${s.pullback}%</td>
+      <td>${s.vol_ratio}x</td>
+      <td>${s.atr_pct}%</td>
+      <td class="${trendCls}">${s.trend ? '✅' : '❌'}</td>
+      <td class="${crossCls}">${s.ema_cross ? '✅' : '❌'}</td>
+      <td>${squeezeStr}</td>
+      <td class="${sentCls}">${s.sentiment}</td>
+      <td class="${posCls}">${s.position ? 'OPEN' : '—'}</td>
+      <td>${pnlStr}</td>
+    </tr>`;
+  }).join('');
+}
+
 function updatePosition(pos, price, s) {
   const el = document.getElementById('position-section');
   if (!pos) {
@@ -413,7 +570,6 @@ function updatePosition(pos, price, s) {
   const peakPct = ((peak - entry) / entry * 100);
   const pnlCls = pnlPct >= 0 ? 'positive' : 'negative';
 
-  // Trailing stop settings from state
   const activationPct = s.trailing_activation_pct || 1.0;
   const trailPct = s.trailing_stop_pct || 0.8;
   const hardStopPct = s.stop_loss_pct || 1.5;
@@ -423,7 +579,6 @@ function updatePosition(pos, price, s) {
   const trailStopLevel = peak * (1 - trailPct / 100);
   const hardStopLevel = entry * (1 - hardStopPct / 100);
 
-  // Progress bar: from hard stop (-hardStopPct%) to peak
   const barMin = entry * (1 - hardStopPct / 100);
   const barMax = Math.max(peak * 1.005, activationPrice * 1.01);
   const barRange = barMax - barMin;
@@ -491,7 +646,10 @@ function updatePosition(pos, price, s) {
         </div>
         <div class="trail-bar-bg">
           <div class="trail-bar-fill" style="width:${currentPct}%;background:${barColor};"></div>
-          ${trailActive ? `<div class="trail-marker" style="left:${trailLevelPct}%;" title="Trail stop: $${trailStopLevel.toFixed(2)}"></div>` : `<div class="trail-marker" style="left:${activationPctBar}%;background:#3b82f6;" title="Trail activates: $${activationPrice.toFixed(2)}"></div>`}
+          ${trailActive
+            ? `<div class="trail-marker" style="left:${trailLevelPct}%;" title="Trail stop: $${trailStopLevel.toFixed(2)}"></div>`
+            : `<div class="trail-marker" style="left:${activationPctBar}%;background:#3b82f6;" title="Trail activates: $${activationPrice.toFixed(2)}"></div>`
+          }
         </div>
         <div style="font-size:11px;color:#64748b;margin-top:5px;text-align:center;">
           ${trailActive
@@ -574,6 +732,7 @@ async function refresh() {
     updateSentiment(s.sentiment);
     updatePosition(s.position, price, s);
     updateTrades(s.trades||[]);
+    updateSignalLog(s.signal_log||[]);
   } catch(e) { console.error(e); }
 }
 
