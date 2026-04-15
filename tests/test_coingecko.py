@@ -3,8 +3,10 @@ Unit tests for CoinGeckoSentiment._parse() and should_block_trade()
 No network calls — uses mock API response data.
 """
 
+from unittest.mock import MagicMock, patch
+
 import pytest
-from unittest.mock import patch, MagicMock
+
 from app.services.coingecko import CoinGeckoSentiment
 
 

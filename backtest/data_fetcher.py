@@ -8,8 +8,9 @@ Saves to CSV so you don't re-fetch every run.
 
 import os
 import time
-import requests
+
 import pandas as pd
+import requests
 from loguru import logger
 
 BINANCE_BASE = "https://api.binance.com"

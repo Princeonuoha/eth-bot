@@ -9,7 +9,6 @@ On exit   → clear position from DB
 On startup → reload position from DB if one exists
 """
 
-import json
 import os
 import sqlite3
 from datetime import datetime

@@ -12,7 +12,7 @@ from dataclasses import dataclass
 import pandas as pd
 from loguru import logger
 
-from backtest.engine import BacktestResult, BacktestTrade
+from backtest.engine import BacktestResult
 
 
 @dataclass
@@ -117,7 +117,7 @@ def print_report(result: BacktestResult) -> BacktestStats:
     print(f"  {stats.start_date} → {stats.end_date}")
     print(sep)
 
-    print(f"\n  CONFIG")
+    print("\n  CONFIG")
     print(f"  {'RSI oversold':<28} {cfg.rsi_oversold}")
     print(f"  {'1h RSI min':<28} {cfg.rsi_1h_min}")
     print(f"  {'Pullback min %':<28} {cfg.pullback_min_pct}%")
@@ -129,7 +129,7 @@ def print_report(result: BacktestResult) -> BacktestStats:
     print(f"  {'Fee %':<28} {cfg.fee_pct}%")
     print(f"  {'Slippage %':<28} {cfg.slippage_pct}%")
 
-    print(f"\n  RESULTS")
+    print("\n  RESULTS")
     print(f"  {'Total trades':<28} {stats.total_trades}")
     print(f"  {'Wins / Losses':<28} {stats.wins} / {stats.losses}")
     print(f"  {'Win rate':<28} {stats.win_rate_pct}%")
@@ -143,14 +143,14 @@ def print_report(result: BacktestResult) -> BacktestStats:
     print(f"  {'Worst trade':<28} ${stats.worst_trade_usdc:+.2f} USDC")
     print(f"  {'Avg peak gain':<28} +{stats.avg_peak_pct:.2f}%")
 
-    print(f"\n  EXIT BREAKDOWN")
+    print("\n  EXIT BREAKDOWN")
     print(f"  {'Stop losses':<28} {stats.stop_loss_count}")
     print(f"  {'Trailing stops':<28} {stats.trailing_stop_count}")
     print(f"  {'Take profits':<28} {stats.take_profit_count}")
     print(f"  {'Partial TPs fired':<28} {stats.partial_tp_count}")
 
     # Recommendations
-    print(f"\n  RECOMMENDATIONS")
+    print("\n  RECOMMENDATIONS")
     if stats.total_trades == 0:
         print("  ⚠️  No trades — filters may be too strict")
     elif stats.total_trades < 10:
