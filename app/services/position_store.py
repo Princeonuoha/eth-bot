@@ -1,12 +1,14 @@
 """
 Position Store
 ──────────────
-Persists open position to SQLite so bot survives restarts without
+Persists open positions to SQLite so bot survives restarts without
 orphaning positions or double-buying.
 
-On entry  → save position to DB
-On exit   → clear position from DB
-On startup → reload position from DB if one exists
+Supports multiple symbols — each symbol gets its own row keyed by symbol.
+
+On entry  → save_position(symbol, ...)
+On exit   → clear_position(symbol)
+On startup → load_position(symbol)
 """
 
 import os
@@ -26,16 +28,15 @@ def _get_conn() -> sqlite3.Connection:
     con = sqlite3.connect(DB_PATH)
     con.execute("""
         CREATE TABLE IF NOT EXISTS open_position (
-            id          INTEGER PRIMARY KEY CHECK (id = 1),  -- only one row ever
-            symbol      TEXT,
-            entry_price REAL,
-            quantity    REAL,
-            order_id    TEXT,
-            entry_time  TEXT,
-            peak_price  REAL,
-            stop_loss_pct  REAL,
+            symbol          TEXT PRIMARY KEY,
+            entry_price     REAL,
+            quantity        REAL,
+            order_id        TEXT,
+            entry_time      TEXT,
+            peak_price      REAL,
+            stop_loss_pct   REAL,
             take_profit_pct REAL,
-            saved_at    TEXT
+            saved_at        TEXT
         )
     """)
     con.commit()
@@ -48,19 +49,15 @@ def save_position(
     stop_loss_pct: float,
     take_profit_pct: float,
 ) -> None:
-    """
-    Upsert the current open position into SQLite.
-    Called after every successful buy order.
-    """
+    """Upsert the current open position for a symbol into SQLite."""
     with _lock:
         con = _get_conn()
         con.execute("""
             INSERT INTO open_position
-                (id, symbol, entry_price, quantity, order_id, entry_time,
+                (symbol, entry_price, quantity, order_id, entry_time,
                  peak_price, stop_loss_pct, take_profit_pct, saved_at)
-            VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(id) DO UPDATE SET
-                symbol          = excluded.symbol,
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(symbol) DO UPDATE SET
                 entry_price     = excluded.entry_price,
                 quantity        = excluded.quantity,
                 order_id        = excluded.order_id,
@@ -83,36 +80,36 @@ def save_position(
         con.commit()
         con.close()
     logger.debug(
-        f"Position saved to DB: entry={position.entry_price} "
+        f"[{position.symbol}] Position saved: entry={position.entry_price} "
         f"qty={position.quantity} peak={peak_price}"
     )
 
 
-def update_peak(peak_price: float) -> None:
-    """Update just the peak price — called every tick while in position."""
+def update_peak(symbol: str, peak_price: float) -> None:
+    """Update just the peak price for a symbol — called every tick while in position."""
     with _lock:
         con = _get_conn()
         con.execute(
-            "UPDATE open_position SET peak_price = ?, saved_at = ? WHERE id = 1",
-            (peak_price, datetime.utcnow().isoformat()),
+            "UPDATE open_position SET peak_price = ?, saved_at = ? WHERE symbol = ?",
+            (peak_price, datetime.utcnow().isoformat(), symbol),
         )
         con.commit()
         con.close()
 
 
-def clear_position() -> None:
-    """Remove the open position — called after every successful sell."""
+def clear_position(symbol: str) -> None:
+    """Remove the open position for a symbol — called after every successful sell."""
     with _lock:
         con = _get_conn()
-        con.execute("DELETE FROM open_position WHERE id = 1")
+        con.execute("DELETE FROM open_position WHERE symbol = ?", (symbol,))
         con.commit()
         con.close()
-    logger.info("Position cleared from DB")
+    logger.info(f"[{symbol}] Position cleared from DB")
 
 
-def load_position() -> tuple[Position | None, float, float, float]:
+def load_position(symbol: str) -> tuple[Position | None, float, float, float]:
     """
-    Load open position from DB on startup.
+    Load open position for a symbol from DB on startup.
     Returns (position, peak_price, stop_loss_pct, take_profit_pct)
     or (None, 0.0, 0.0, 0.0) if no position exists.
     """
@@ -121,14 +118,14 @@ def load_position() -> tuple[Position | None, float, float, float]:
         row = con.execute("""
             SELECT symbol, entry_price, quantity, order_id,
                    entry_time, peak_price, stop_loss_pct, take_profit_pct
-            FROM open_position WHERE id = 1
-        """).fetchone()
+            FROM open_position WHERE symbol = ?
+        """, (symbol,)).fetchone()
         con.close()
 
     if not row:
         return None, 0.0, 0.0, 0.0
 
-    symbol, entry_price, quantity, order_id, entry_time, peak_price, sl_pct, tp_pct = row
+    sym, entry_price, quantity, order_id, entry_time, peak_price, sl_pct, tp_pct = row
 
     try:
         entry_dt = datetime.fromisoformat(entry_time)
@@ -136,7 +133,7 @@ def load_position() -> tuple[Position | None, float, float, float]:
         entry_dt = datetime.utcnow()
 
     position = Position(
-        symbol=symbol,
+        symbol=sym,
         entry_price=entry_price,
         quantity=quantity,
         order_id=order_id,
@@ -144,7 +141,7 @@ def load_position() -> tuple[Position | None, float, float, float]:
     )
 
     logger.warning(
-        f"⚠️  Restoring open position from DB: "
+        f"[{symbol}] ⚠️  Restoring open position from DB: "
         f"entry=${entry_price} qty={quantity} peak=${peak_price} "
         f"SL={sl_pct}% TP={tp_pct}%"
     )

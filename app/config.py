@@ -1,5 +1,5 @@
-from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic import Field
 
 
 class Settings(BaseSettings):
@@ -10,8 +10,22 @@ class Settings(BaseSettings):
     binance_api_secret: str = Field(..., description="Binance API secret")
     testnet: bool = Field(default=True, description="Use Binance Spot Testnet")
 
-    # Strategy
+    # Strategy — multi-symbol
+    # SYMBOLS takes precedence. Comma-separated: ETHUSDC,BTCUSDC
+    # Falls back to SYMBOL for backwards compatibility.
+    symbols: str = Field(
+        default="",
+        description="Comma-separated list of trading pairs e.g. ETHUSDC,BTCUSDC"
+    )
     symbol: str = Field(default="ETHUSDC")
+
+    @property
+    def active_symbols(self) -> list[str]:
+        """Returns the list of symbols to trade."""
+        if self.symbols:
+            return [s.strip() for s in self.symbols.split(",") if s.strip()]
+        return [self.symbol]
+
     trade_amount_usdc: float = Field(default=100.0)
     stop_loss_pct: float = Field(
         default=1.5,
