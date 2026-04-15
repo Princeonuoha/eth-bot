@@ -13,13 +13,17 @@ BASE_BUY_KWARGS = dict(
     trend_bullish=True,
     ema_slope=0.05,       # rising EMA
     rsi=35.0,             # below oversold threshold
+    rsi_1h=55.0,          # 1h RSI above minimum
     pullback_pct=1.0,     # above minimum pullback
     volume_ratio=1.0,     # normal volume
     in_position=False,
+    ema_50_above_200=True,  # golden cross active
+    bb_squeeze=False,       # squeeze is bonus info, not a blocker
     rsi_oversold=38.0,
     pullback_min_pct=0.8,
     ema_slope_min_pct=0.0,
     max_volume_ratio=1.5,
+    rsi_1h_min=45.0,
 )
 
 # ── is_trend_bullish ──────────────────────────────────────────────────────────
@@ -104,6 +108,18 @@ def test_buy_passes_when_strict_slope_met():
     assert should_buy(**{**BASE_BUY_KWARGS, "ema_slope": 0.06, "ema_slope_min_pct": 0.05}) is True
 
 
+def test_buy_blocked_when_no_golden_cross():
+    assert should_buy(**{**BASE_BUY_KWARGS, "ema_50_above_200": False}) is False
+
+
+def test_buy_blocked_when_1h_rsi_too_low():
+    assert should_buy(**{**BASE_BUY_KWARGS, "rsi_1h": 44.9}) is False
+
+
+def test_buy_passes_when_1h_rsi_at_min():
+    assert should_buy(**{**BASE_BUY_KWARGS, "rsi_1h": 45.0}) is True
+
+
 # ── should_sell — stop loss ───────────────────────────────────────────────────
 
 BASE_SELL_KWARGS = dict(
@@ -111,8 +127,11 @@ BASE_SELL_KWARGS = dict(
     current_price=2000.0,
     peak_price=2000.0,
     stop_loss_pct=1.5,
+    take_profit_pct=0.0,      # disabled — let trail handle it
     trailing_activation_pct=1.0,
     trailing_stop_pct=0.8,
+    partial_tp_pct=0.0,       # disabled in base
+    partial_done=False,
 )
 
 
@@ -177,6 +196,30 @@ def test_trailing_stop_does_not_fire_at_trail_level():
         "peak_price": peak,
     })
     assert result == "trailing_stop"
+
+
+# ── should_sell — partial take profit ────────────────────────────────────────
+
+def test_partial_tp_fires_when_gain_reached():
+    result = should_sell(**{
+        **BASE_SELL_KWARGS,
+        "current_price": 2020.0,  # +1%
+        "peak_price": 2020.0,
+        "partial_tp_pct": 1.0,
+        "partial_done": False,
+    })
+    assert result == "partial_take_profit"
+
+
+def test_partial_tp_does_not_fire_twice():
+    result = should_sell(**{
+        **BASE_SELL_KWARGS,
+        "current_price": 2020.0,
+        "peak_price": 2020.0,
+        "partial_tp_pct": 1.0,
+        "partial_done": True,  # already fired
+    })
+    assert result is None
 
 
 # ── should_sell — hold scenarios ─────────────────────────────────────────────
