@@ -40,3 +40,13 @@ htmlcov/
 
 # Docker
 *.override.yml
+
+# Runtime data
+trades.db
+*.bak
+
+# Backtest data (regeneratable from data_fetcher.py)
+backtest/data/*.csv
+backtest/data/*.parquet
+backtest/rsi_cross_trades.csv
+backtest/*_trades.csv
