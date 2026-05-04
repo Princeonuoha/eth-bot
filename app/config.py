@@ -26,6 +26,26 @@ class Settings(BaseSettings):
             return [s.strip() for s in self.symbols.split(",") if s.strip()]
         return [self.symbol]
 
+    # Per-symbol pullback overrides — optional
+    # e.g. ETHUSDC_PULLBACK_MIN_PCT=2.0, BTCUSDC_PULLBACK_MIN_PCT=1.5, SOLUSDC_PULLBACK_MIN_PCT=1.2
+    # Falls back to pullback_min_pct if not set.
+    ethusdc_pullback_min_pct: float = Field(default=0.0)
+    btcusdc_pullback_min_pct: float = Field(default=0.0)
+    solusdc_pullback_min_pct: float = Field(default=0.0)
+    linkusdc_pullback_min_pct: float = Field(default=0.0)
+
+    def pullback_for(self, symbol: str) -> float:
+        """Returns the pullback threshold for a given symbol.
+        Uses per-symbol override if set (>0), otherwise falls back to global."""
+        overrides = {
+            "ETHUSDC": self.ethusdc_pullback_min_pct,
+            "BTCUSDC": self.btcusdc_pullback_min_pct,
+            "SOLUSDC": self.solusdc_pullback_min_pct,
+	    "LINKUSDC": self.linkusdc_pullback_min_pct,
+        }
+        override = overrides.get(symbol, 0.0)
+        return override if override > 0 else self.pullback_min_pct
+
     trade_amount_usdc: float = Field(default=100.0)
     stop_loss_pct: float = Field(
         default=1.5,

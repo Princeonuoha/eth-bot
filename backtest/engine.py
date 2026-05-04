@@ -8,6 +8,12 @@ rolling-window version.
 Key difference from slow version:
   - Slow: recomputes RSI/EMA/ATR from scratch on every candle
   - Fast: computes full indicator series once, then indexes by position
+
+Cooldown simulation:
+  - Mirrors trader.py SymbolState cooldown logic exactly
+  - After a stop loss: blocks re-entry for base_minutes * consecutive_stop_losses
+  - Consecutive stop losses reset to 0 on a win (trailing_stop or take_profit)
+  - Default base=15min, max=60min — matches live bot defaults
 """
 
 from dataclasses import dataclass, field
@@ -56,15 +62,10 @@ class BacktestConfig:
     atr_tp_max_pct: float = 4.0
     fee_pct: float = 0.1
     slippage_pct: float = 0.05
-
-
-@dataclass
-class BacktestResult:
-    config: BacktestConfig
-    trades: list[BacktestTrade] = field(default_factory=list)
-    start_date: str = ""
-    end_date: str = ""
-    symbol: str = ""
+    # Cooldown — mirrors trader.py SymbolState logic
+    # base * consecutive_stop_losses, capped at max
+    stop_loss_cooldown_minutes: int = 15   # base=900s in live bot
+    stop_loss_cooldown_max_minutes: int = 60  # max_cd=3600s in live bot
 
 
 # ── Vectorized indicator functions ────────────────────────────────────────────
@@ -130,6 +131,15 @@ def _atr_tp(atr_pct: pd.Series, rsi: pd.Series, ema_slope: pd.Series,
     tp = tp.where(ema_slope <= 0.05, tp * 1.15)
     tp = tp.where(ema_slope >= 0, tp * 0.90)
     return tp.clip(min_pct, max_pct).round(2)
+
+
+@dataclass
+class BacktestResult:
+    config: BacktestConfig
+    trades: list[BacktestTrade] = field(default_factory=list)
+    start_date: str = ""
+    end_date: str = ""
+    symbol: str = ""
 
 
 def _precompute(df_15m: pd.DataFrame, df_1h: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
@@ -205,6 +215,24 @@ def run(
     active_stop_loss_pct: float = config.stop_loss_pct
     active_take_profit_pct: float = config.take_profit_pct
     partial_done: bool = False
+
+    # Cooldown state — mirrors trader.py SymbolState exactly
+    last_stop_loss_time: pd.Timestamp | None = None
+    consecutive_stop_losses: int = 0
+
+    def _cooldown_minutes() -> int:
+        """Mirrors SymbolState.cooldown_seconds() but in minutes."""
+        base = config.stop_loss_cooldown_minutes
+        cap = config.stop_loss_cooldown_max_minutes
+        return min(base * max(1, consecutive_stop_losses), cap)
+
+    def _in_cooldown(current_time: pd.Timestamp) -> bool:
+        if config.stop_loss_cooldown_minutes == 0:
+            return False
+        if last_stop_loss_time is None:
+            return False
+        elapsed = (current_time - last_stop_loss_time).total_seconds() / 60
+        return elapsed < _cooldown_minutes()
 
     for candle_time, row in combined.iterrows():
         price = float(row["close"])
@@ -285,9 +313,27 @@ def run(
                 active_stop_loss_pct = config.stop_loss_pct
                 active_take_profit_pct = config.take_profit_pct
 
+                # ── Cooldown state update ─────────────────────────────────────
+                if decision == "stop_loss":
+                    consecutive_stop_losses += 1
+                    last_stop_loss_time = candle_time
+                    cd = _cooldown_minutes()
+                    logger.debug(
+                        f"[{symbol}] Stop loss #{consecutive_stop_losses} — "
+                        f"cooldown {cd}min"
+                    )
+                else:
+                    # Win resets the streak, mirrors trader.py _execute_sell
+                    consecutive_stop_losses = 0
+
             continue
 
         # ── Entry logic ───────────────────────────────────────────────────────
+
+        # Cooldown check — mirrors trader.py SymbolState.in_cooldown()
+        if _in_cooldown(candle_time):
+            continue
+
         if (
             not pd.isna(rsi) and not pd.isna(rsi_1h)
             and trend_ok

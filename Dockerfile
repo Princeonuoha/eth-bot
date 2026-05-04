@@ -28,6 +28,6 @@ USER botuser
 
 # Health check — used by docker-compose depends_on
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
-    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:5000/health')" || exit 1
+    CMD pgrep -f "python -m app.main" || exit 1
 
 CMD ["python", "-m", "app.main"]

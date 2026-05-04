@@ -2,6 +2,13 @@
 Trader — Main trading loop.
 Supports multiple symbols concurrently. Each symbol has its own
 isolated state (position, peak, cooldown, partial_done, etc).
+
+Stop loss handling:
+  Exchange-side STOP_LOSS_LIMIT orders are placed immediately after every BUY.
+  The exchange monitors price continuously and triggers the sell without loop latency.
+  Each tick we poll the SL order status — if FILLED, we record the trade and clean up.
+  When the trailing stop raises the SL price, we cancel the old order and replace it.
+  Partial TP and trailing stop exits remain software-side (dynamic price targets).
 """
 
 import time
@@ -32,10 +39,20 @@ from app.strategy.indicators import (
 )
 from app.strategy.risk_manager import RiskManager
 from app.strategy.signal_engine import is_trend_bullish, should_buy, should_sell
-from app.services.position_store import save_position, update_peak, clear_position, load_position
+from app.services.position_store import (
+    save_position,
+    update_peak,
+    update_sl_order_id,
+    clear_position,
+    load_position,
+)
 
 DASHBOARD_URL = "http://eth-dashboard:5000/api/trade"
 DASHBOARD_SIGNAL_URL = "http://eth-dashboard:5000/api/signal"
+
+# Minimum SL price move (%) before we bother cancelling + replacing the
+# exchange SL order. Avoids spamming Binance on every trailing tick update.
+_SL_REPLACE_THRESHOLD_PCT = 0.05
 
 
 @dataclass
@@ -50,6 +67,11 @@ class SymbolState:
     last_stop_loss_time: float = 0.0
     consecutive_stop_losses: int = 0
     day_trades: list = field(default_factory=list)
+
+    # Exchange-side SL order tracking
+    sl_order_id: str | None = None          # Binance orderId of the active STOP_LOSS_LIMIT
+    sl_order_price: float = 0.0             # Stop price of the current exchange SL order
+                                            # Used to detect when trail has moved enough to replace
 
     def cooldown_seconds(self) -> int:
         base = 900
@@ -84,23 +106,73 @@ class Trader:
         self.states: dict[str, SymbolState] = {}
         for sym in settings.active_symbols:
             state = SymbolState(symbol=sym)
-            position, peak_price, sl_pct, tp_pct = load_position(sym)
+            position, peak_price, sl_pct, tp_pct, sl_order_id = load_position(sym)
             state.position = position
             state.peak_price = peak_price
             state.active_stop_loss_pct = sl_pct if sl_pct > 0 else settings.stop_loss_pct
             state.active_take_profit_pct = tp_pct if tp_pct > 0 else settings.take_profit_pct
+            state.sl_order_id = sl_order_id
             self.states[sym] = state
+
             if position:
                 logger.warning(
                     f"[{sym}] ⚠️  Resumed open position — "
                     f"entry=${position.entry_price} | peak=${peak_price} | "
-                    f"SL={state.active_stop_loss_pct:.2f}%"
+                    f"SL={state.active_stop_loss_pct:.2f}% | "
+                    f"sl_order_id={sl_order_id}"
                 )
+                # Verify exchange SL order status on restart — it may have
+                # filled while the bot was down
+                if sl_order_id:
+                    self._verify_sl_order_on_startup(state)
+
+    def _verify_sl_order_on_startup(self, state: SymbolState) -> None:
+        """
+        Check if the exchange SL order filled while the bot was offline.
+        If filled → record the trade as a stop_loss and clean up.
+        If missing/cancelled → replace it so we're never unprotected.
+        """
+        symbol = state.symbol
+        try:
+            order = self.client.get_order_status(symbol, state.sl_order_id)
+            status = order.get("status", "UNKNOWN")
+            logger.info(f"[{symbol}] Startup SL order check: id={state.sl_order_id} status={status}")
+
+            if status == "FILLED":
+                logger.warning(
+                    f"[{symbol}] SL order filled while bot was offline — "
+                    f"recording stop_loss and cleaning up"
+                )
+                avg_price = (
+                    float(order.get("cummulativeQuoteQty", 0)) / float(order.get("executedQty", 1))
+                    if float(order.get("executedQty", 0)) > 0
+                    else state.position.entry_price * (1 - state.active_stop_loss_pct / 100)
+                )
+                self._record_stop_loss_fill(state, avg_price)
+
+            elif status in ("CANCELED", "REJECTED", "EXPIRED", "UNKNOWN"):
+                logger.warning(
+                    f"[{symbol}] SL order {state.sl_order_id} is {status} — replacing"
+                )
+                self._place_exchange_sl(state)
+
+            else:
+                # NEW or TRIGGERED — still active, update our local price tracking
+                stop_price = float(order.get("stopPrice", 0))
+                if stop_price > 0:
+                    state.sl_order_price = stop_price
+                logger.info(f"[{symbol}] SL order still active (status={status})")
+
+        except BotExchangeError as e:
+            logger.error(
+                f"[{symbol}] Could not verify SL order on startup: {e} — "
+                f"placing fresh SL order"
+            )
+            self._place_exchange_sl(state)
 
     def _fetch_initial_portfolio_value(self) -> float:
         try:
             usdc = self.client.get_balance("USDC")
-            # Use first symbol for price reference
             sym = settings.active_symbols[0]
             base = sym.replace("USDC", "").replace("USDT", "")
             base_bal = self.client.get_balance(base)
@@ -128,6 +200,7 @@ class Trader:
             f"  Partial TP: {settings.partial_tp_pct}% → sell {int(settings.partial_tp_ratio * 100)}% | "
             f"trail remainder"
         )
+        logger.info(f"  SL mode: exchange-side STOP_LOSS_LIMIT orders ✅")
         logger.info("=" * 60)
         self.notifier.bot_started(settings.testnet)
 
@@ -220,19 +293,28 @@ class Trader:
 
         logger.debug(
             f"[{symbol}] price=${price:.4f} | 15m RSI={rsi:.1f} | 1h RSI={rsi_1h:.1f} | "
-            f"pullback={pullback:.2f}% | trend={'✅' if trend_ok else '❌'} | "
+            f"pullback={pullback:.2f}% (min={settings.pullback_for(symbol)}%) | trend={'✅' if trend_ok else '❌'} | "
             f"50>200={'✅' if ema_50_above_200 else '❌'} | "
             f"ema_slope={ema_slope:.4f}% | vol_ratio={volume_ratio:.2f}x | "
             f"atr={atr_pct:.2f}% | squeeze={'🔥' if bb_squeeze else '—'} | "
             f"cg={cg.sentiment if cg else 'unavailable'} | "
             f"peak=${state.peak_price:.4f} | "
+            f"sl_order={'🛡️ ' + str(state.sl_order_id) if state.sl_order_id else '⚠️ none'} | "
             f"cooldown={'🕐 ' + str(state.seconds_remaining_cooldown()) + 's' if state.in_cooldown() else 'none'} | "
             f"position={'open' if state.position else 'none'}"
             f"{' | partial=done' if state.partial_done else ''}"
         )
 
-        # ── Sell logic ────────────────────────────────────────────────────────
+        # ── In-position logic ─────────────────────────────────────────────────
         if state.position:
+
+            # 1. Check if exchange SL order already filled (exchange beat us to it)
+            if state.sl_order_id:
+                if self._check_sl_order_filled(state):
+                    return  # SL was already executed by exchange — done for this tick
+
+            # 2. Software-side sell signals: partial TP and trailing stop
+            #    (Stop loss is now handled exchange-side — excluded from should_sell)
             decision = should_sell(
                 entry_price=state.position.entry_price,
                 current_price=price,
@@ -244,12 +326,39 @@ class Trader:
                 partial_tp_pct=settings.partial_tp_pct,
                 partial_done=state.partial_done,
             )
+
             if decision == "partial_take_profit":
+                self._cancel_exchange_sl(state)
                 self._execute_partial_sell(symbol, state, price, cg_summary=cg.summary if cg else None)
+                # Re-place SL for the remaining quantity after partial
+                self._place_exchange_sl(state)
                 return
-            elif decision:
+
+            elif decision == "trailing_stop":
+                # Software trailing stop fired — cancel exchange SL and execute
+                self._cancel_exchange_sl(state)
                 self._execute_sell(symbol, state, price, decision, cg_summary=cg.summary if cg else None)
                 return
+
+            elif decision == "take_profit":
+                self._cancel_exchange_sl(state)
+                self._execute_sell(symbol, state, price, decision, cg_summary=cg.summary if cg else None)
+                return
+
+            elif decision == "stop_loss":
+                # Shouldn't normally reach here — exchange SL should fire first.
+                # Fallback: software catches it if exchange SL failed/cancelled.
+                logger.warning(
+                    f"[{symbol}] Software stop loss triggered — "
+                    f"exchange SL order may have failed (id={state.sl_order_id})"
+                )
+                self._cancel_exchange_sl(state)
+                self._execute_sell(symbol, state, price, decision, cg_summary=cg.summary if cg else None)
+                return
+
+            # 3. Update exchange SL if trailing has raised our stop price significantly
+            self._maybe_replace_exchange_sl(state)
+            return
 
         # ── Buy logic ─────────────────────────────────────────────────────────
         if not self.risk.can_trade():
@@ -279,7 +388,7 @@ class Trader:
             ema_50_above_200=ema_50_above_200,
             bb_squeeze=bb_squeeze,
             rsi_oversold=settings.rsi_oversold,
-            pullback_min_pct=settings.pullback_min_pct,
+            pullback_min_pct=settings.pullback_for(symbol),
             ema_slope_min_pct=settings.ema_slope_min_pct,
             max_volume_ratio=settings.max_volume_ratio,
             rsi_1h_min=settings.rsi_1h_min,
@@ -305,6 +414,210 @@ class Trader:
                 )
 
             self._execute_buy(symbol, state, price, atr_pct=atr_pct, cg_summary=cg.summary if cg else None)
+
+    # ── Exchange SL order helpers ─────────────────────────────────────────────
+
+    def _place_exchange_sl(self, state: SymbolState) -> None:
+        """
+        Place a STOP_LOSS_LIMIT order on Binance for the current position.
+        Stores the order ID in state and DB.
+        Called after every BUY and after cancel/replace on trail update.
+        """
+        if not state.position:
+            return
+
+        symbol = state.symbol
+        stop_price = round(
+            state.position.entry_price * (1 - state.active_stop_loss_pct / 100), 2
+        )
+
+        try:
+            order = self.client.place_stop_loss_order(
+                symbol=symbol,
+                quantity=state.position.quantity,
+                stop_price=stop_price,
+            )
+            state.sl_order_id = str(order["orderId"])
+            state.sl_order_price = stop_price
+            update_sl_order_id(symbol, state.sl_order_id)
+            logger.info(
+                f"[{symbol}] Exchange SL placed: id={state.sl_order_id} "
+                f"stopPrice=${stop_price:.2f} 🛡️"
+            )
+        except BotExchangeError as e:
+            logger.error(
+                f"[{symbol}] Failed to place exchange SL order: {e} — "
+                f"software SL remains as fallback"
+            )
+
+    def _cancel_exchange_sl(self, state: SymbolState) -> None:
+        """
+        Cancel the active exchange SL order before executing a software sell.
+        Must be called before any _execute_sell or _execute_partial_sell
+        to avoid a double-sell race condition.
+        """
+        if not state.sl_order_id:
+            return
+
+        self.client.cancel_order(state.symbol, state.sl_order_id)
+        state.sl_order_id = None
+        state.sl_order_price = 0.0
+
+    def _check_sl_order_filled(self, state: SymbolState) -> bool:
+        """
+        Poll the exchange SL order status each tick.
+        If FILLED → record the stop_loss trade and clean up.
+        If cancelled/rejected → log warning (software SL remains as fallback).
+
+        Returns True if the SL was filled (caller should return from _tick).
+        """
+        symbol = state.symbol
+        try:
+            order = self.client.get_order_status(symbol, state.sl_order_id)
+            status = order.get("status", "UNKNOWN")
+
+            if status == "FILLED":
+                logger.info(
+                    f"[{symbol}] Exchange SL order FILLED: id={state.sl_order_id} 🛡️→💥"
+                )
+                exec_qty = float(order.get("executedQty", state.position.quantity))
+                cum_quote = float(order.get("cummulativeQuoteQty", 0))
+                avg_price = cum_quote / exec_qty if exec_qty > 0 else state.sl_order_price
+                self._record_stop_loss_fill(state, avg_price)
+                return True
+
+            if status in ("CANCELED", "REJECTED", "EXPIRED"):
+                logger.warning(
+                    f"[{symbol}] Exchange SL order {state.sl_order_id} is {status} — "
+                    f"software SL is active as fallback. Attempting to replace."
+                )
+                state.sl_order_id = None
+                state.sl_order_price = 0.0
+                self._place_exchange_sl(state)
+
+        except BotExchangeError as e:
+            logger.warning(f"[{symbol}] Could not check SL order status: {e}")
+
+        return False
+
+    def _maybe_replace_exchange_sl(self, state: SymbolState) -> None:
+        """
+        Check if the trailing stop has raised our desired SL price enough
+        to warrant cancelling and replacing the exchange SL order.
+
+        Only replaces if the new stop price is more than _SL_REPLACE_THRESHOLD_PCT
+        higher than the current exchange SL price — avoids spamming Binance.
+        """
+        if not state.position or not state.sl_order_id:
+            return
+
+        # Compute what the current ideal SL price should be
+        # (trailing stop raises the floor as peak_price increases)
+        if state.peak_price <= state.position.entry_price:
+            return  # Price never went above entry, no trail to update
+
+        # Current trailing stop price based on peak
+        trail_sl_price = round(
+            state.peak_price * (1 - settings.trailing_stop_pct / 100), 2
+        )
+
+        # Only replace if it's meaningfully higher than our current exchange SL
+        if state.sl_order_price <= 0:
+            return
+
+        move_pct = ((trail_sl_price - state.sl_order_price) / state.sl_order_price) * 100
+
+        if move_pct >= _SL_REPLACE_THRESHOLD_PCT:
+            logger.info(
+                f"[{state.symbol}] Trail raised SL: "
+                f"${state.sl_order_price:.2f} → ${trail_sl_price:.2f} "
+                f"(+{move_pct:.3f}%) — replacing exchange SL order"
+            )
+            self._cancel_exchange_sl(state)
+            # Temporarily override stop loss to the trail price for _place_exchange_sl
+            original_sl_pct = state.active_stop_loss_pct
+            trail_sl_pct = ((state.position.entry_price - trail_sl_price) / state.position.entry_price) * 100
+            state.active_stop_loss_pct = trail_sl_pct
+            self._place_exchange_sl(state)
+            state.active_stop_loss_pct = original_sl_pct  # restore
+
+    def _record_stop_loss_fill(self, state: SymbolState, fill_price: float) -> None:
+        """
+        Record a stop_loss trade that was executed by the exchange SL order.
+        Handles PnL calculation, notifications, DB cleanup — same as _execute_sell
+        but without placing another order (exchange already did it).
+        """
+        symbol = state.symbol
+        if not state.position:
+            return
+
+        pnl_usdc = state.position.pnl_usdc(fill_price)
+        pnl_pct = state.position.pnl_pct(fill_price)
+        peak_pct = (
+            (state.peak_price - state.position.entry_price) / state.position.entry_price
+        ) * 100
+
+        state.consecutive_stop_losses += 1
+        state.last_stop_loss_time = time.time()
+        cd = state.cooldown_seconds()
+        logger.info(
+            f"[{symbol}] Exchange stop loss #{state.consecutive_stop_losses} @ ${fill_price:.4f} | "
+            f"PnL={pnl_usdc:+.2f} USDC ({pnl_pct:+.3f}%) | "
+            f"cooldown {cd}s ({cd // 60} min)"
+        )
+
+        event = TradeEvent(
+            symbol=symbol,
+            side="SELL",
+            price=fill_price,
+            quantity=state.position.quantity,
+            reason="stop_loss",
+        )
+        self.trade_log.append(event)
+        self.risk.record_trade_result(pnl_usdc)
+        state.day_trades.append({"pnl_usdc": pnl_usdc, "reason": "stop_loss"})
+
+        cg = self.coingecko.get_sentiment()
+        bal_usdc, bal_base, total_val = self._get_balances(symbol)
+        self.notifier.trade_closed(
+            symbol, "stop_loss", pnl_usdc, pnl_pct,
+            daily_pnl=self.risk._daily_pnl_usdc,
+            cg_summary=cg.summary if cg else None,
+            balance_usdc=bal_usdc,
+            balance_eth=bal_base,
+            total_value=total_val,
+            peak_pct=peak_pct,
+        )
+        self._push_to_dashboard({
+            "symbol": symbol,
+            "side": "SELL",
+            "price": fill_price,
+            "quantity": state.position.quantity,
+            "reason": "stop_loss",
+            "pnl_usdc": round(pnl_usdc, 4),
+            "pnl_pct": round(pnl_pct, 4),
+            "daily_pnl": round(self.risk._daily_pnl_usdc, 4),
+            "peak_pct": round(peak_pct, 4),
+        })
+
+        if self.risk.is_halted:
+            self.notifier.daily_halted(
+                self.risk._daily_pnl_usdc,
+                balance_usdc=bal_usdc,
+                total_value=total_val,
+            )
+
+        # Clean up state
+        state.peak_price = 0.0
+        state.partial_done = False
+        state.active_stop_loss_pct = settings.stop_loss_pct
+        state.active_take_profit_pct = settings.take_profit_pct
+        state.sl_order_id = None
+        state.sl_order_price = 0.0
+        state.position = None
+        clear_position(symbol)
+
+    # ── Trade execution ───────────────────────────────────────────────────────
 
     def _get_balances(self, symbol: str) -> tuple[float, float, float]:
         try:
@@ -335,12 +648,27 @@ class Trader:
         )
         state.peak_price = avg_price
         state.partial_done = False
+        state.sl_order_id = None
+        state.sl_order_price = 0.0
 
         save_position(
             state.position,
             peak_price=state.peak_price,
             stop_loss_pct=state.active_stop_loss_pct,
             take_profit_pct=state.active_take_profit_pct,
+            sl_order_id=None,
+        )
+
+        # Place exchange-side SL order immediately after buy
+        self._place_exchange_sl(state)
+
+        # Persist the sl_order_id now that we have it
+        save_position(
+            state.position,
+            peak_price=state.peak_price,
+            stop_loss_pct=state.active_stop_loss_pct,
+            take_profit_pct=state.active_take_profit_pct,
+            sl_order_id=state.sl_order_id,
         )
 
         event = TradeEvent(symbol=symbol, side="BUY", price=avg_price, quantity=qty, reason="signal")
@@ -365,6 +693,7 @@ class Trader:
         logger.info(
             f"[{symbol}] BUY executed @ ${avg_price:.4f} | qty={qty} | "
             f"SL={state.active_stop_loss_pct:.2f}% | "
+            f"exchange SL order id={state.sl_order_id} | "
             f"partial TP at +{settings.partial_tp_pct}% | "
             f"trail activates at +{settings.trailing_activation_pct}%"
         )
@@ -416,6 +745,7 @@ class Trader:
             peak_price=state.peak_price,
             stop_loss_pct=state.active_stop_loss_pct,
             take_profit_pct=state.active_take_profit_pct,
+            sl_order_id=state.sl_order_id,  # will be updated by caller after re-place
         )
 
         self.risk.record_trade_result(partial_pnl_usdc)
@@ -516,8 +846,12 @@ class Trader:
         state.partial_done = False
         state.active_stop_loss_pct = settings.stop_loss_pct
         state.active_take_profit_pct = settings.take_profit_pct
+        state.sl_order_id = None
+        state.sl_order_price = 0.0
         state.position = None
         clear_position(symbol)
+
+    # ── Dashboard & utility ───────────────────────────────────────────────────
 
     def _push_to_dashboard(self, trade: dict) -> None:
         try:
@@ -544,7 +878,6 @@ class Trader:
     def _send_daily_summary(self) -> None:
         try:
             date_str = self._today.isoformat()
-            # Aggregate across all symbols
             all_trades = []
             for state in self.states.values():
                 all_trades.extend(state.day_trades)
@@ -557,7 +890,6 @@ class Trader:
             best = max((t["pnl_usdc"] for t in closed), default=None)
             worst = min((t["pnl_usdc"] for t in closed), default=None)
 
-            # Use first symbol for balance fetch
             sym = settings.active_symbols[0]
             bal_usdc, _, total_val = self._get_balances(sym)
 
