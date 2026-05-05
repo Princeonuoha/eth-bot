@@ -12,12 +12,12 @@ Stop loss handling:
 """
 
 import time
-from pathlib import Path
-import requests
 from dataclasses import dataclass, field
-from datetime import datetime, date
+from datetime import date, datetime
+from pathlib import Path
 from typing import Optional
 
+import requests
 from loguru import logger
 
 from app.config import settings
@@ -26,27 +26,27 @@ from app.models.position import Position
 from app.models.trade_event import TradeEvent
 from app.services.coingecko import CoinGeckoSentiment
 from app.services.notifier import Notifier
-from app.strategy.indicators import (
-    compute_ema,
-    compute_ema_50,
-    compute_ema_slope,
-    compute_atr,
-    compute_atr_stop_pct,
-    compute_atr_take_profit_pct,
-    compute_pullback_pct,
-    compute_rsi,
-    compute_volume_ratio,
-    compute_bb_squeeze,
-)
-from app.strategy.risk_manager import RiskManager
-from app.strategy.signal_engine import is_trend_bullish, should_buy, should_sell
 from app.services.position_store import (
+    clear_position,
+    load_position,
     save_position,
     update_peak,
     update_sl_order_id,
-    clear_position,
-    load_position,
 )
+from app.strategy.indicators import (
+    compute_atr,
+    compute_atr_stop_pct,
+    compute_atr_take_profit_pct,
+    compute_bb_squeeze,
+    compute_ema,
+    compute_ema_50,
+    compute_ema_slope,
+    compute_pullback_pct,
+    compute_rsi,
+    compute_volume_ratio,
+)
+from app.strategy.risk_manager import RiskManager
+from app.strategy.signal_engine import is_trend_bullish, should_buy, should_sell
 
 HEARTBEAT_FILE = Path("/app/data/heartbeat")
 
@@ -203,7 +203,7 @@ class Trader:
             f"  Partial TP: {settings.partial_tp_pct}% → sell {int(settings.partial_tp_ratio * 100)}% | "
             f"trail remainder"
         )
-        logger.info(f"  SL mode: exchange-side STOP_LOSS_LIMIT orders ✅")
+        logger.info("  SL mode: exchange-side STOP_LOSS_LIMIT orders ✅")
         logger.info("=" * 60)
         self.notifier.bot_started(settings.testnet)
 

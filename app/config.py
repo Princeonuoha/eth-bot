@@ -1,5 +1,5 @@
-from pydantic_settings import BaseSettings, SettingsConfigDict
 from pydantic import Field
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
@@ -41,7 +41,7 @@ class Settings(BaseSettings):
             "ETHUSDC": self.ethusdc_pullback_min_pct,
             "BTCUSDC": self.btcusdc_pullback_min_pct,
             "SOLUSDC": self.solusdc_pullback_min_pct,
-	    "LINKUSDC": self.linkusdc_pullback_min_pct,
+            "LINKUSDC": self.linkusdc_pullback_min_pct,
         }
         override = overrides.get(symbol, 0.0)
         return override if override > 0 else self.pullback_min_pct
