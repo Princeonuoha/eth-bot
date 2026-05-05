@@ -27,7 +27,7 @@ RUN mkdir -p data logs \
 USER botuser
 
 # Health check — used by docker-compose depends_on
-HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
-    CMD pgrep -f "python -m app.main" || exit 1
+HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
+    CMD python -c "import time, pathlib; age = time.time() - float(pathlib.Path('/app/data/heartbeat').read_text()); exit(0 if age < 60 else 1)"
 
 CMD ["python", "-m", "app.main"]

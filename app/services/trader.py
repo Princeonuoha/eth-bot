@@ -12,6 +12,7 @@ Stop loss handling:
 """
 
 import time
+from pathlib import Path
 import requests
 from dataclasses import dataclass, field
 from datetime import datetime, date
@@ -46,6 +47,8 @@ from app.services.position_store import (
     clear_position,
     load_position,
 )
+
+HEARTBEAT_FILE = Path("/app/data/heartbeat")
 
 DASHBOARD_URL = "http://eth-dashboard:5000/api/trade"
 DASHBOARD_SIGNAL_URL = "http://eth-dashboard:5000/api/signal"
@@ -205,6 +208,7 @@ class Trader:
         self.notifier.bot_started(settings.testnet)
 
         while True:
+            HEARTBEAT_FILE.write_text(str(time.time()))
             try:
                 self._maybe_reset_daily()
                 for sym in settings.active_symbols:
