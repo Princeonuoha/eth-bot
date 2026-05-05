@@ -107,12 +107,12 @@ class BinanceClient:
 
     def place_market_sell(self, symbol: str, quantity: float) -> dict:
         """
-        Sell a specific ETH quantity at market price.
+        Sell a specific quantity at market price.
         Always fills but may suffer slippage in volatile conditions.
-        Prefer place_limit_sell_with_fallback for stop loss exits.
+        Prefer place_limit_sell_with_fallback for software-triggered exits.
         """
         try:
-            logger.info(f"ORDER: MARKET SELL {symbol} qty={quantity:.6f} ETH")
+            logger.info(f"ORDER: MARKET SELL {symbol} qty={quantity:.6f}")
             order = self._client.new_order(
                 symbol=symbol,
                 side="SELL",
@@ -123,6 +123,96 @@ class BinanceClient:
             return order
         except Exception as e:
             raise BotExchangeError(f"place_market_sell failed: {e}") from e
+
+    def place_stop_loss_order(
+        self,
+        symbol: str,
+        quantity: float,
+        stop_price: float,
+        limit_buffer_pct: float = 0.2,
+    ) -> dict:
+        """
+        Place a STOP_LOSS_LIMIT order on the exchange.
+
+        The exchange monitors price continuously and triggers the sell the
+        moment price hits stop_price — no loop latency, no polling required.
+
+        How it works:
+          - stopPrice: the trigger price (when market hits this, the limit order activates)
+          - price: the actual limit sell price (slightly below stop to ensure fill)
+          - limit_buffer_pct: gap between stop and limit (default 0.2%)
+            Too tight = order may not fill if price gaps through.
+            Too wide = sells further below your intended SL.
+            0.2% is a sensible default for liquid pairs like ETH/SOL.
+
+        Args:
+            symbol: e.g. 'SOLUSDC'
+            quantity: quantity to sell
+            stop_price: the trigger price (entry * (1 - stop_loss_pct / 100))
+            limit_buffer_pct: how far below stop_price to set the limit price
+
+        Returns:
+            Full Binance order response dict (orderId is what we store)
+        """
+        qty_rounded = round(quantity, 5)
+        # Round to 2dp — works for ETH/SOL/BTC USDC pairs
+        stop_price_rounded = round(stop_price, 2)
+        limit_price = round(stop_price * (1 - limit_buffer_pct / 100), 2)
+
+        logger.info(
+            f"ORDER: STOP_LOSS_LIMIT {symbol} qty={qty_rounded} "
+            f"stopPrice=${stop_price_rounded:.2f} limitPrice=${limit_price:.2f} "
+            f"(buffer={limit_buffer_pct}%)"
+        )
+
+        try:
+            order = self._client.new_order(
+                symbol=symbol,
+                side="SELL",
+                type="STOP_LOSS_LIMIT",
+                timeInForce="GTC",
+                quantity=qty_rounded,
+                stopPrice=str(stop_price_rounded),
+                price=str(limit_price),
+            )
+            logger.info(
+                f"STOP_LOSS_LIMIT PLACED: id={order['orderId']} "
+                f"stopPrice=${stop_price_rounded:.2f} ✅"
+            )
+            return order
+        except Exception as e:
+            raise BotExchangeError(f"place_stop_loss_order failed: {e}") from e
+
+    def get_order_status(self, symbol: str, order_id: int | str) -> dict:
+        """
+        Fetch current status of an order by ID.
+
+        Returns the full order dict. Key field is ['status']:
+          NEW       — sitting on the book, not yet triggered
+          TRIGGERED — stop price hit, limit order now active (STOP_LOSS_LIMIT only)
+          FILLED    — fully executed
+          CANCELED  — manually cancelled
+          REJECTED  — exchange rejected it
+          EXPIRED   — time-in-force expired
+        """
+        try:
+            return self._client.get_order(symbol=symbol, orderId=int(order_id))
+        except Exception as e:
+            raise BotExchangeError(f"get_order_status failed: {e}") from e
+
+    def cancel_order(self, symbol: str, order_id: int | str) -> dict:
+        """
+        Cancel an open order by ID.
+        Safe to call even if order is already filled — catches and logs the error.
+        """
+        try:
+            result = self._client.cancel_order(symbol=symbol, orderId=int(order_id))
+            logger.info(f"ORDER CANCELLED: id={order_id} ({symbol})")
+            return result
+        except Exception as e:
+            # Order may have already filled — log but don't raise
+            logger.warning(f"cancel_order {order_id} ({symbol}): {e}")
+            return {}
 
     def place_limit_sell_with_fallback(
         self,
@@ -137,17 +227,12 @@ class BinanceClient:
         If the limit order doesn't fill within fallback_timeout_seconds, cancel
         it and fall back to a market sell.
 
-        Why this matters:
-          A market sell during a flash crash fills at whatever exists — could be
-          5-10% below your stop price. A limit sell guarantees you don't sell
-          worse than your chosen price, at the cost of possibly not filling.
-          The fallback ensures you always exit — you just get a small window
-          to try for the better price first.
+        Used for software-triggered exits: partial TP and trailing stop.
+        Stop loss exits are handled by exchange-side STOP_LOSS_LIMIT orders.
 
         Args:
             trigger_price: The price that triggered the sell decision.
             limit_buffer_pct: How far below trigger to place the limit (default 0.3%).
-                              0.3% gives room to fill without much extra loss.
             fallback_timeout_seconds: Seconds to wait for limit fill before going market.
         """
         limit_price = round(trigger_price * (1 - limit_buffer_pct / 100), 2)

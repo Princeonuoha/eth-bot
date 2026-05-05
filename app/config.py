@@ -10,8 +10,42 @@ class Settings(BaseSettings):
     binance_api_secret: str = Field(..., description="Binance API secret")
     testnet: bool = Field(default=True, description="Use Binance Spot Testnet")
 
-    # Strategy
+    # Strategy — multi-symbol
+    # SYMBOLS takes precedence. Comma-separated: ETHUSDC,BTCUSDC
+    # Falls back to SYMBOL for backwards compatibility.
+    symbols: str = Field(
+        default="",
+        description="Comma-separated list of trading pairs e.g. ETHUSDC,BTCUSDC"
+    )
     symbol: str = Field(default="ETHUSDC")
+
+    @property
+    def active_symbols(self) -> list[str]:
+        """Returns the list of symbols to trade."""
+        if self.symbols:
+            return [s.strip() for s in self.symbols.split(",") if s.strip()]
+        return [self.symbol]
+
+    # Per-symbol pullback overrides — optional
+    # e.g. ETHUSDC_PULLBACK_MIN_PCT=2.0, BTCUSDC_PULLBACK_MIN_PCT=1.5, SOLUSDC_PULLBACK_MIN_PCT=1.2
+    # Falls back to pullback_min_pct if not set.
+    ethusdc_pullback_min_pct: float = Field(default=0.0)
+    btcusdc_pullback_min_pct: float = Field(default=0.0)
+    solusdc_pullback_min_pct: float = Field(default=0.0)
+    linkusdc_pullback_min_pct: float = Field(default=0.0)
+
+    def pullback_for(self, symbol: str) -> float:
+        """Returns the pullback threshold for a given symbol.
+        Uses per-symbol override if set (>0), otherwise falls back to global."""
+        overrides = {
+            "ETHUSDC": self.ethusdc_pullback_min_pct,
+            "BTCUSDC": self.btcusdc_pullback_min_pct,
+            "SOLUSDC": self.solusdc_pullback_min_pct,
+            "LINKUSDC": self.linkusdc_pullback_min_pct,
+        }
+        override = overrides.get(symbol, 0.0)
+        return override if override > 0 else self.pullback_min_pct
+
     trade_amount_usdc: float = Field(default=100.0)
     stop_loss_pct: float = Field(
         default=1.5,

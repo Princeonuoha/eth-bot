@@ -20,6 +20,15 @@ Usage (from ~/eth-bot):
   # Save trade log to CSV
   python -m backtest.run_backtest --save-csv
 
+  # Simulate live bot cooldown (default — 15min base, 60min max)
+  python -m backtest.run_backtest --symbol SOLUSDC --start 2026-01-01
+
+  # Custom cooldown base
+  python -m backtest.run_backtest --symbol SOLUSDC --start 2026-01-01 --cooldown-min 30
+
+  # Disable cooldown to see raw signal performance
+  python -m backtest.run_backtest --symbol SOLUSDC --start 2026-01-01 --no-cooldown
+
 Examples to validate before going live:
   # Current testnet loose params
   python -m backtest.run_backtest --rsi-oversold 62 --pullback-min 0.2
@@ -75,6 +84,36 @@ def parse_args():
     parser.add_argument("--fee", type=float, default=0.1, help="Fee % per side")
     parser.add_argument("--slippage", type=float, default=0.05, help="Slippage %")
 
+    # Cooldown simulation — mirrors trader.py SymbolState cooldown logic
+    parser.add_argument(
+        "--cooldown-min",
+        type=int,
+        default=15,
+        help=(
+            "Base cooldown minutes after a stop loss. Scales with consecutive stop losses "
+            "(e.g. 15min base: SL#1=15min, SL#2=30min, SL#3=45min). "
+            "Mirrors live bot default of 900s base. (default: 15)"
+        ),
+    )
+    parser.add_argument(
+        "--cooldown-max",
+        type=int,
+        default=60,
+        help=(
+            "Max cooldown minutes regardless of consecutive stop losses. "
+            "Mirrors live bot max_cd of 3600s. (default: 60)"
+        ),
+    )
+    parser.add_argument(
+        "--no-cooldown",
+        action="store_true",
+        help=(
+            "Disable cooldown simulation entirely. "
+            "Use this to see raw signal performance without cooldown filtering. "
+            "WARNING: results will be optimistic vs live bot behaviour."
+        ),
+    )
+
     # Other
     parser.add_argument("--refresh", action="store_true", help="Re-download candle data")
     parser.add_argument("--save-csv", action="store_true", help="Save trade log to CSV")
@@ -89,6 +128,10 @@ def main():
     if args.quiet:
         logger.remove()
         logger.add(lambda msg: print(msg, end=""), level="INFO")
+
+    # Cooldown: 0 disables it in the engine
+    cooldown_min = 0 if args.no_cooldown else args.cooldown_min
+    cooldown_max = 0 if args.no_cooldown else args.cooldown_max
 
     config = BacktestConfig(
         trade_amount_usdc=args.trade_amount,
@@ -108,6 +151,8 @@ def main():
         atr_tp_max_pct=args.atr_tp_max,
         fee_pct=args.fee,
         slippage_pct=args.slippage,
+        stop_loss_cooldown_minutes=cooldown_min,
+        stop_loss_cooldown_max_minutes=cooldown_max,
     )
 
     # Fetch data
