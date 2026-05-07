@@ -22,6 +22,17 @@ from loguru import logger
 
 from app.config import settings
 from app.exchange.binance_client import BinanceClient, BotExchangeError
+from app.metrics import (
+    bot_consecutive_stop_losses,
+    bot_daily_pnl_usdc,
+    bot_exchange_errors_total,
+    bot_position_open,
+    bot_pnl_usdc,
+    bot_signal_skip_total,
+    bot_sl_order_active,
+    bot_trades_total,
+)
+
 from app.models.position import Position
 from app.models.trade_event import TradeEvent
 from app.services.coingecko import CoinGeckoSentiment
@@ -129,6 +140,15 @@ class Trader:
                 if sl_order_id:
                     self._verify_sl_order_on_startup(state)
 
+        # Initialise Prometheus gauges so all metrics exist on first scrape
+        for sym in settings.active_symbols:
+            st = self.states[sym]
+            bot_position_open.labels(sym).set(1 if st.position else 0)
+            bot_sl_order_active.labels(sym).set(1 if st.sl_order_id else 0)
+            bot_consecutive_stop_losses.labels(sym).set(st.consecutive_stop_losses)
+            bot_pnl_usdc.labels(sym).set(0.0)
+        bot_daily_pnl_usdc.set(0.0)
+
     def _verify_sl_order_on_startup(self, state: SymbolState) -> None:
         """
         Check if the exchange SL order filled while the bot was offline.
@@ -214,6 +234,18 @@ class Trader:
                 for sym in settings.active_symbols:
                     self._tick(sym)
             except BotExchangeError as e:
+                err_str = str(e)
+                if "502" in err_str:
+                    err_type = "http_502"
+                elif "503" in err_str:
+                    err_type = "http_503"
+                elif "429" in err_str:
+                    err_type = "http_429"
+                elif "timeout" in err_str.lower():
+                    err_type = "timeout"
+                else:
+                    err_type = "other"
+                bot_exchange_errors_total.labels(err_type).inc()
                 logger.error(f"Exchange error: {e} — will retry")
             except KeyboardInterrupt:
                 logger.info("Bot stopped by user.")
@@ -366,6 +398,7 @@ class Trader:
 
         # ── Buy logic ─────────────────────────────────────────────────────────
         if not self.risk.can_trade():
+            bot_signal_skip_total.labels("risk_halted").inc()
             return
 
         if state.in_cooldown():
@@ -373,12 +406,14 @@ class Trader:
                 f"[{symbol}] Cooldown active — {state.seconds_remaining_cooldown()}s remaining "
                 f"(consecutive SLs: {state.consecutive_stop_losses})"
             )
+            bot_signal_skip_total.labels("cooldown").inc()
             return
 
         if not cg_ok:
             logger.info(
                 f"[{symbol}] CoinGecko: skipping buy — EXTREME FEAR + price below 200 EMA | {cg.summary}"
             )
+            bot_signal_skip_total.labels("sentiment").inc()
             return
 
         if should_buy(
@@ -418,6 +453,13 @@ class Trader:
                 )
 
             self._execute_buy(symbol, state, price, atr_pct=atr_pct, cg_summary=cg.summary if cg else None)
+        else:
+            bot_signal_skip_total.labels(
+                self._first_skip_reason(
+                    trend_ok, ema_50_above_200, ema_slope, rsi, rsi_1h,
+                    pullback, volume_ratio, symbol,
+                )
+            ).inc()
 
     # ── Exchange SL order helpers ─────────────────────────────────────────────
 
@@ -448,6 +490,7 @@ class Trader:
                 f"[{symbol}] Exchange SL placed: id={state.sl_order_id} "
                 f"stopPrice=${stop_price:.2f} 🛡️"
             )
+            bot_sl_order_active.labels(symbol).set(1)
         except BotExchangeError as e:
             logger.error(
                 f"[{symbol}] Failed to place exchange SL order: {e} — "
@@ -466,6 +509,7 @@ class Trader:
         self.client.cancel_order(state.symbol, state.sl_order_id)
         state.sl_order_id = None
         state.sl_order_price = 0.0
+        bot_sl_order_active.labels(state.symbol).set(0)
 
     def _check_sl_order_filled(self, state: SymbolState) -> bool:
         """
@@ -604,6 +648,12 @@ class Trader:
             "peak_pct": round(peak_pct, 4),
         })
 
+        bot_trades_total.labels(symbol, "stop_loss").inc()
+        bot_pnl_usdc.labels(symbol).set(
+            sum(t["pnl_usdc"] for t in state.day_trades if t.get("pnl_usdc") is not None)
+        )
+        bot_daily_pnl_usdc.set(self.risk._daily_pnl_usdc)
+
         if self.risk.is_halted:
             self.notifier.daily_halted(
                 self.risk._daily_pnl_usdc,
@@ -620,6 +670,10 @@ class Trader:
         state.sl_order_price = 0.0
         state.position = None
         clear_position(symbol)
+
+        bot_position_open.labels(symbol).set(0)
+        bot_sl_order_active.labels(symbol).set(0)
+        bot_consecutive_stop_losses.labels(symbol).set(state.consecutive_stop_losses)
 
     # ── Trade execution ───────────────────────────────────────────────────────
 
@@ -693,6 +747,8 @@ class Trader:
             "quantity": qty,
             "reason": "signal",
         })
+
+        bot_position_open.labels(symbol).set(1)
 
         logger.info(
             f"[{symbol}] BUY executed @ ${avg_price:.4f} | qty={qty} | "
@@ -777,6 +833,12 @@ class Trader:
             "peak_pct": round(peak_pct, 4),
         })
 
+        bot_trades_total.labels(symbol, "partial_take_profit").inc()
+        bot_pnl_usdc.labels(symbol).set(
+            sum(t["pnl_usdc"] for t in state.day_trades if t.get("pnl_usdc") is not None)
+        )
+        bot_daily_pnl_usdc.set(self.risk._daily_pnl_usdc)
+
     def _execute_sell(
         self, symbol: str, state: SymbolState, price: float,
         reason: str, cg_summary: str | None = None
@@ -839,6 +901,12 @@ class Trader:
             "peak_pct": round(peak_pct, 4),
         })
 
+        bot_trades_total.labels(symbol, reason).inc()
+        bot_pnl_usdc.labels(symbol).set(
+            sum(t["pnl_usdc"] for t in state.day_trades if t.get("pnl_usdc") is not None)
+        )
+        bot_daily_pnl_usdc.set(self.risk._daily_pnl_usdc)
+
         if self.risk.is_halted:
             self.notifier.daily_halted(
                 self.risk._daily_pnl_usdc,
@@ -855,6 +923,10 @@ class Trader:
         state.position = None
         clear_position(symbol)
 
+        bot_position_open.labels(symbol).set(0)
+        bot_sl_order_active.labels(symbol).set(0)
+        bot_consecutive_stop_losses.labels(symbol).set(state.consecutive_stop_losses)
+
     # ── Dashboard & utility ───────────────────────────────────────────────────
 
     def _push_to_dashboard(self, trade: dict) -> None:
@@ -869,14 +941,44 @@ class Trader:
         except Exception:
             pass
 
+    def _first_skip_reason(
+        self,
+        trend_ok: bool,
+        ema_50_above_200: bool,
+        ema_slope: float,
+        rsi: float,
+        rsi_1h: float,
+        pullback: float,
+        volume_ratio: float,
+        symbol: str,
+    ) -> str:
+        """Return the first failing buy-gate condition as a Prometheus label string."""
+        if not trend_ok:
+            return "no_uptrend"
+        if not ema_50_above_200:
+            return "ema_cross"
+        if ema_slope < settings.ema_slope_min_pct:
+            return "ema_slope"
+        if rsi >= settings.rsi_oversold:
+            return "rsi_15m"
+        if rsi_1h < settings.rsi_1h_min:
+            return "rsi_1h"
+        if pullback < settings.pullback_for(symbol):
+            return "pullback"
+        if volume_ratio > settings.max_volume_ratio:
+            return "volume"
+        return "other"
+
     def _maybe_reset_daily(self) -> None:
         today = datetime.utcnow().date()
         if today != self._today:
             self._send_daily_summary()
             logger.info(f"New trading day: {today}")
             self.risk.reset_daily()
+            bot_daily_pnl_usdc.set(0.0)
             for state in self.states.values():
                 state.day_trades = []
+                bot_pnl_usdc.labels(state.symbol).set(0.0)
             self._today = today
 
     def _send_daily_summary(self) -> None:

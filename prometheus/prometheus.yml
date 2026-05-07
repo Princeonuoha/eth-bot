@@ -1,0 +1,19 @@
+# Prometheus scrape configuration for eth-bot
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    monitor: 'eth-bot-prod'
+
+scrape_configs:
+  # eth-bot itself — exposes /metrics on :8000 inside the docker network
+  - job_name: 'eth-bot'
+    static_configs:
+      - targets: ['eth-bot:8000']
+        labels:
+          service: 'trading-bot'
+
+  # Prometheus self-monitoring (useful baseline)
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']

@@ -1,10 +1,11 @@
 import sys
 
 from loguru import logger
+from prometheus_client import start_http_server
 
 from app.services.trader import Trader
 
-# ── Logging setup ─────────────────────────────────────────────────────────────
+# — Logging setup ————————————————————————————————————————————————————————————
 logger.remove()
 logger.add(
     sys.stderr,
@@ -21,6 +22,8 @@ logger.add(
 
 
 def main():
+    start_http_server(8000)
+    logger.info("Prometheus metrics server started on :8000")
     trader = Trader()
     trader.run()
 
