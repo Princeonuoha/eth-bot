@@ -26,13 +26,12 @@ from app.metrics import (
     bot_consecutive_stop_losses,
     bot_daily_pnl_usdc,
     bot_exchange_errors_total,
-    bot_position_open,
     bot_pnl_usdc,
+    bot_position_open,
     bot_signal_skip_total,
     bot_sl_order_active,
     bot_trades_total,
 )
-
 from app.models.position import Position
 from app.models.trade_event import TradeEvent
 from app.services.coingecko import CoinGeckoSentiment
