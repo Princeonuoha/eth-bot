@@ -24,6 +24,13 @@ from app.config import settings
 from app.exchange.binance_client import BinanceClient
 from app.services.coingecko import CoinGeckoSentiment
 
+from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
+from app.metrics import (
+    bot_trades_total, bot_signal_skip_total,
+    bot_pnl_usdc, bot_position_open, bot_sl_order_active,
+    bot_consecutive_stop_losses, bot_daily_pnl_usdc,
+)
+
 app = Flask(__name__)
 
 DB_PATH = os.environ.get("DB_PATH", "/app/data/trades.db")
@@ -315,6 +322,9 @@ def add_signal():
     _signal_logs[symbol].appendleft(signal)
     return jsonify({"ok": True})
 
+@app.route("/metrics")
+def metrics():
+    return generate_latest(), 200, {"Content-Type": CONTENT_TYPE_LATEST}
 
 # ── HTML ──────────────────────────────────────────────────────────────────────
 

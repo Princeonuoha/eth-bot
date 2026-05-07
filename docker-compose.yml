@@ -1,28 +1,23 @@
 version: "3.9"
-
 # ── Volumes ───────────────────────────────────────────────────────────────────
-# Named volumes survive container restarts, rebuilds, and reboots.
-# data/ → trades.db + position DB (position_store.py writes here)
-# logs/ → rotating log files from both services
 volumes:
   data:
   logs:
-
+  prometheus_data:
+  grafana_data:
 # ── Services ──────────────────────────────────────────────────────────────────
 services:
-
-  # Flask dashboard — starts first, bot depends on it
   dashboard:
     build: .
     container_name: eth-dashboard
-    restart: always                  # always restart — even after EC2 reboot
+    restart: always
     command: python -m app.dashboard
     env_file:
       - .env
     ports:
       - "5000:5000"
     volumes:
-      - data:/app/data               # trades.db lives here
+      - data:/app/data
       - logs:/app/logs
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:5000/health')"]
@@ -36,23 +31,69 @@ services:
         max-size: "10m"
         max-file: "5"
 
-  # Trading bot — waits for dashboard to be healthy before starting
   eth-bot:
     build: .
     container_name: eth-bot
-    restart: always                  # auto-restarts within 60s if it crashes
+    restart: always
     env_file:
       - .env
     environment:
-      - DB_PATH=/app/data/trades.db  # point to persistent volume
+      - DB_PATH=/app/data/trades.db
+    ports:
+      - "8000:8000"
     volumes:
-      - data:/app/data               # trades.db + position_store DB
+      - data:/app/data
       - logs:/app/logs
     depends_on:
       dashboard:
-        condition: service_healthy   # don't start until dashboard is ready
+        condition: service_started
     logging:
       driver: "json-file"
       options:
         max-size: "10m"
         max-file: "5"
+
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    container_name: prometheus
+    restart: always
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--storage.tsdb.retention.time=30d'
+      - '--web.console.libraries=/usr/share/prometheus/console_libraries'
+      - '--web.console.templates=/usr/share/prometheus/consoles'
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    depends_on:
+      - eth-bot
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  grafana:
+    image: grafana/grafana:11.2.0
+    container_name: grafana
+    restart: always
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD}
+      - GF_USERS_ALLOW_SIGN_UP=false
+      - GF_INSTALL_PLUGINS=
+    ports:
+      - "3000:3000"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+    depends_on:
+      - prometheus
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
