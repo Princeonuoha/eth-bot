@@ -17,6 +17,7 @@ services:
     ports:
       - "5000:5000"
     volumes:
+      - ./app:/app/app:ro
       - data:/app/data
       - logs:/app/logs
     healthcheck:
@@ -42,6 +43,7 @@ services:
     ports:
       - "8000:8000"
     volumes:
+      - ./app:/app/app:ro
       - data:/app/data
       - logs:/app/logs
     depends_on:

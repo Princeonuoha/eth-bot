@@ -10,6 +10,16 @@ class Settings(BaseSettings):
     binance_api_secret: str = Field(..., description="Binance API secret")
     testnet: bool = Field(default=True, description="Use Binance Spot Testnet")
 
+    # Strategy selection — which Strategy class to load at startup.
+    # See app/strategy/ for available strategies (currently: pullback).
+    strategy: str = Field(
+        default="pullback",
+        description=(
+            "Strategy name. Must be a key in signal_engine._STRATEGIES. "
+            "Default 'pullback' preserves the original entry logic."
+        ),
+    )
+
     # Strategy — multi-symbol
     # SYMBOLS takes precedence. Comma-separated: ETHUSDC,BTCUSDC
     # Falls back to SYMBOL for backwards compatibility.

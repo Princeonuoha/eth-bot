@@ -1,50 +1,81 @@
 """
 Signal Engine
 ─────────────
-Decides WHEN to buy and WHEN to sell based on indicator readings.
-All logic is pure functions — easy to test, no side effects.
+Primary role (post-refactor): strategy dispatcher.
 
-Entry strategy (Phase 2):
-  - Trend filter      : price is above 200 EMA on the 1h timeframe
-  - Golden cross      : 50 EMA above 200 EMA — medium-term trend aligned
-  - EMA slope         : 200 EMA must be rising (slope > threshold) — prevents
-                        buying into a downtrending market that briefly pokes above EMA
-  - 1h RSI gate       : 1h RSI > rsi_1h_min — higher timeframe not bearish
-  - Pullback          : RSI(14) < rsi_oversold AND price is X% below recent high
-  - Volume filter     : current candle volume must not be a panic spike
-                        (volume_ratio < max_volume_ratio) — avoids buying capitulation
-  - BB squeeze        : optional bonus confirmation — volatility compressed = coiling
-  - One position at a time
+  `get_strategy()` loads the active Strategy subclass selected by
+  `settings.strategy`. Each strategy owns its own entry and exit logic;
+  trader.py calls `strategy.evaluate_entry(ctx, in_position=...)` and
+  `strategy.evaluate_exit(pos)` directly.
 
-Exit strategy (hybrid — partial TP + trailing):
-  - Hard stop loss       : PnL <= -stop_loss_pct (protects against big drops)
-  - Partial take profit  : at partial_tp_pct%, sell partial_tp_ratio of position
-                           (e.g. 50% at +0.8%) — banks quick wins on ranging days
-  - Trailing stop        : activates at trailing_activation_pct%, trails the remainder
-                           — rides big moves after partial has been taken
-  - Full take profit     : optional hard exit for the remainder if set > 0
+Compatibility layer:
+
+  The legacy pure functions (`should_buy`, `should_sell`,
+  `is_ema_slope_bullish`) are kept here byte-for-byte during the
+  trader.py migration. Removing them before trader.py stops calling
+  them would crash the bot. They will be deleted in a follow-up commit
+  once trader.py is fully on the Strategy API.
+
+  `is_trend_bullish` stays permanently — it's used by trader.py for
+  non-strategy concerns (signal log entries, CoinGecko gating).
+
+To add a new strategy:
+  1. Create `app/strategy/<name>.py` with a `Strategy` subclass.
+  2. Register it in `_STRATEGIES` below.
+  3. Set `STRATEGY=<name>` in `.env`.
 """
 
 from loguru import logger
 
+from app.config import settings
+from app.strategy.base import Strategy
+from app.strategy.pullback import PullbackStrategy
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Strategy registry — the dispatcher
+# ─────────────────────────────────────────────────────────────────────────────
+
+_STRATEGIES: dict[str, type[Strategy]] = {
+    "pullback": PullbackStrategy,
+}
+
+
+def get_strategy() -> Strategy:
+    """Return an instance of the strategy named by `settings.strategy`."""
+    cls = _STRATEGIES.get(settings.strategy)
+    if cls is None:
+        raise ValueError(
+            f"Unknown strategy '{settings.strategy}'. "
+            f"Available: {sorted(_STRATEGIES)}"
+        )
+    logger.info(f"Strategy loaded: {settings.strategy}")
+    return cls(settings)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Shared market helper — stays permanently
+# ─────────────────────────────────────────────────────────────────────────────
+
 
 def is_trend_bullish(current_price: float, ema_200: float) -> bool:
-    """Macro trend filter: only buy when price is above the 200 EMA."""
+    """Macro trend filter: only buy when price is above the 200 EMA.
+
+    Used by trader.py for non-strategy concerns (CoinGecko gating, signal
+    log entries). Strategies derive their own trend booleans internally.
+    """
     return current_price > ema_200
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Legacy pure-function API — kept working during the strategy refactor.
+# These will be removed once trader.py is fully migrated to the Strategy API.
+# Do not extend or modify; new logic goes in a Strategy subclass.
+# ─────────────────────────────────────────────────────────────────────────────
 
 
 def is_ema_slope_bullish(ema_slope: float, min_slope_pct: float = 0.0) -> bool:
     """
     Returns True if the 200 EMA is rising (slope > min_slope_pct).
-
-    Why this matters:
-      A rising EMA = the trend is strengthening upward.
-      A flat/falling EMA = price is just touching EMA from below during a downtrend.
-      The March 22 losing trade entered when ETH briefly crossed EMA during a
-      downtrend — a positive slope check would have blocked it.
-
-    min_slope_pct=0.0 means any positive slope passes.
-    Use 0.02 or 0.05 for a stricter filter.
     """
     return ema_slope > min_slope_pct
 
@@ -67,19 +98,13 @@ def should_buy(
     rsi_1h_min: float = 45.0,
 ) -> bool:
     """
-    Returns True if ALL entry conditions are met.
+    Legacy entry decision — preserved during trader.py migration.
 
-    Filters (in order):
-      1. Not already in position
-      2. Price above 200 EMA (macro trend)
-      3. 50 EMA above 200 EMA (golden cross zone — medium trend aligned)
-      4. EMA slope rising (not just touching from below during downtrend)
-      5. 1h RSI > rsi_1h_min (higher timeframe not oversold/bearish)
-      6. 15m RSI < rsi_oversold (short timeframe dip = entry opportunity)
-      7. Pullback > pullback_min_pct (meaningful dip, not just noise)
-      8. Volume ratio < max_volume_ratio (no panic candles)
-      9. BB squeeze is logged as bonus info but does NOT block entry —
-         it upgrades signal quality when present.
+    See PullbackStrategy.evaluate_entry for the canonical version. The
+    gate order and boundary conditions here are the original ones; the
+    new strategy fixes a minor metric-labelling discrepancy (rsi_1h vs
+    rsi_15m ordering) that does not affect this function's True/False
+    output.
     """
     if in_position:
         logger.debug("Signal: skip — already in position")
@@ -148,45 +173,22 @@ def should_sell(
     partial_done: bool = False,
 ) -> str | None:
     """
-    Exit logic — four layers, checked in priority order:
+    Legacy exit decision — preserved during trader.py migration.
 
-    1. Hard stop loss      — fires if PnL <= -stop_loss_pct. Always active.
-
-    2. Partial take profit — fires ONCE when PnL hits partial_tp_pct%.
-                             Sells partial_tp_ratio of position (e.g. 50%).
-                             Banks quick wins on ranging days.
-                             Set partial_tp_pct=0 to disable.
-                             Only fires if partial_done=False.
-
-    3. Trailing stop       — activates once price rises trailing_activation_pct%.
-                             Trails trailing_stop_pct% below peak.
-                             Handles the remainder after partial TP, or full
-                             position if partial TP is disabled.
-
-    4. Full take profit    — hard exit for remainder if take_profit_pct > 0.
-                             Optional override — set to 0 to let trail handle it.
-
-    Hybrid example (partial_tp_pct=0.8, trailing_activation_pct=1.0):
-      Entry: $2200
-      → Price hits $2217.6 (+0.8%) → sell 50%, bank $8
-      → Price keeps running to $2374 (+7.9%)
-      → Trail activates at $2222, trails 0.8% below peak
-      → Price drops from $2374 → trail fires at ~$2355
-      → Remaining 50% exits at +7% → ~$32 more
-      Total: ~$40 vs $8 from pure TP exit ✅
+    See base.hybrid_exit for the canonical version (this function's body
+    was moved there verbatim).
 
     Returns:
-        "stop_loss" | "partial_take_profit" | "take_profit" | "trailing_stop" | None
+        "stop_loss" | "partial_take_profit" | "take_profit" |
+        "trailing_stop" | None
     """
     pnl_pct = ((current_price - entry_price) / entry_price) * 100
     peak_pct = ((peak_price - entry_price) / entry_price) * 100
 
-    # 1. Hard stop loss — always checked first
     if pnl_pct <= -stop_loss_pct:
         logger.warning(f"Signal: STOP LOSS 🛑 | PnL={pnl_pct:.2f}%")
         return "stop_loss"
 
-    # 2. Partial take profit — fires once at partial_tp_pct%
     if partial_tp_pct > 0 and not partial_done and pnl_pct >= partial_tp_pct:
         logger.info(
             f"Signal: PARTIAL TAKE PROFIT 💰 | PnL={pnl_pct:.2f}% | "
@@ -194,7 +196,6 @@ def should_sell(
         )
         return "partial_take_profit"
 
-    # 3. Full take profit — hard exit if configured
     if take_profit_pct > 0 and pnl_pct >= take_profit_pct:
         logger.info(
             f"Signal: TAKE PROFIT 🎯 | PnL={pnl_pct:.2f}% | "
@@ -202,7 +203,6 @@ def should_sell(
         )
         return "take_profit"
 
-    # 4. Trailing stop — rides the remainder after partial TP
     trailing_active = peak_pct >= trailing_activation_pct
     if trailing_active:
         trailing_stop_level = peak_price * (1 - trailing_stop_pct / 100)
