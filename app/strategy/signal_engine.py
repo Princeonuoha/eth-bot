@@ -31,7 +31,6 @@ from app.config import settings
 from app.strategy.base import Strategy
 from app.strategy.pullback import PullbackStrategy
 
-
 # ─────────────────────────────────────────────────────────────────────────────
 # Strategy registry — the dispatcher
 # ─────────────────────────────────────────────────────────────────────────────

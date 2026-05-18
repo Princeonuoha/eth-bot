@@ -43,6 +43,7 @@ from app.services.position_store import (
     update_peak,
     update_sl_order_id,
 )
+from app.strategy.base import MarketContext, PositionContext
 from app.strategy.indicators import (
     compute_atr,
     compute_atr_stop_pct,
@@ -56,7 +57,6 @@ from app.strategy.indicators import (
     compute_volume_ratio,
 )
 from app.strategy.risk_manager import RiskManager
-from app.strategy.base import MarketContext, PositionContext
 from app.strategy.signal_engine import get_strategy, is_trend_bullish
 
 HEARTBEAT_FILE = Path("/app/data/heartbeat")

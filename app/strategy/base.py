@@ -20,7 +20,6 @@ from loguru import logger
 
 from app.config import Settings
 
-
 # ── Context objects ──────────────────────────────────────────────────────────
 
 @dataclass
