@@ -56,7 +56,8 @@ from app.strategy.indicators import (
     compute_volume_ratio,
 )
 from app.strategy.risk_manager import RiskManager
-from app.strategy.signal_engine import is_trend_bullish, should_buy, should_sell
+from app.strategy.base import MarketContext, PositionContext
+from app.strategy.signal_engine import get_strategy, is_trend_bullish
 
 HEARTBEAT_FILE = Path("/app/data/heartbeat")
 
@@ -114,6 +115,8 @@ class Trader:
             portfolio_drawdown_pct=settings.portfolio_drawdown_pct,
             initial_portfolio_value=initial_value,
         )
+
+        self.strategy = get_strategy()
 
         # Initialise per-symbol state
         self.states: dict[str, SymbolState] = {}
@@ -348,19 +351,17 @@ class Trader:
                 if self._check_sl_order_filled(state):
                     return  # SL was already executed by exchange — done for this tick
 
-            # 2. Software-side sell signals: partial TP and trailing stop
-            #    (Stop loss is now handled exchange-side — excluded from should_sell)
-            decision = should_sell(
+            # 2. Software-side sell signals — delegate to the active strategy.
+            #    Stop loss is handled exchange-side (excluded from hybrid_exit).
+            pos_ctx = PositionContext(
                 entry_price=state.position.entry_price,
                 current_price=price,
                 peak_price=state.peak_price,
+                partial_done=state.partial_done,
                 stop_loss_pct=state.active_stop_loss_pct,
                 take_profit_pct=state.active_take_profit_pct,
-                trailing_activation_pct=settings.trailing_activation_pct,
-                trailing_stop_pct=settings.trailing_stop_pct,
-                partial_tp_pct=settings.partial_tp_pct,
-                partial_done=state.partial_done,
             )
+            decision = self.strategy.evaluate_exit(pos_ctx)
 
             if decision == "partial_take_profit":
                 self._cancel_exchange_sl(state)
@@ -415,22 +416,25 @@ class Trader:
             bot_signal_skip_total.labels("sentiment").inc()
             return
 
-        if should_buy(
-            trend_bullish=trend_ok,
-            ema_slope=ema_slope,
-            rsi=rsi,
+        # Build market context and ask the active strategy
+        ctx = MarketContext(
+            symbol=symbol,
+            price=price,
+            rsi_15m=rsi,
             rsi_1h=rsi_1h,
+            ema_200=ema_200,
+            ema_50=ema_50,
+            ema_slope=ema_slope,
             pullback_pct=pullback,
             volume_ratio=volume_ratio,
-            in_position=state.position is not None,
-            ema_50_above_200=ema_50_above_200,
             bb_squeeze=bb_squeeze,
-            rsi_oversold=settings.rsi_oversold,
-            pullback_min_pct=settings.pullback_for(symbol),
-            ema_slope_min_pct=settings.ema_slope_min_pct,
-            max_volume_ratio=settings.max_volume_ratio,
-            rsi_1h_min=settings.rsi_1h_min,
-        ):
+            atr_pct=atr_pct,
+        )
+        entry = self.strategy.evaluate_entry(
+            ctx, in_position=state.position is not None
+        )
+
+        if entry.should_enter:
             atr_stop = compute_atr_stop_pct(
                 highs_15m, lows_15m, closes_15m,
                 period=14,
@@ -453,12 +457,7 @@ class Trader:
 
             self._execute_buy(symbol, state, price, atr_pct=atr_pct, cg_summary=cg.summary if cg else None)
         else:
-            bot_signal_skip_total.labels(
-                self._first_skip_reason(
-                    trend_ok, ema_50_above_200, ema_slope, rsi, rsi_1h,
-                    pullback, volume_ratio, symbol,
-                )
-            ).inc()
+            bot_signal_skip_total.labels(entry.skip_reason).inc()
 
     # ── Exchange SL order helpers ─────────────────────────────────────────────
 
@@ -939,34 +938,6 @@ class Trader:
             requests.post(DASHBOARD_SIGNAL_URL, json=signal, timeout=1)
         except Exception:
             pass
-
-    def _first_skip_reason(
-        self,
-        trend_ok: bool,
-        ema_50_above_200: bool,
-        ema_slope: float,
-        rsi: float,
-        rsi_1h: float,
-        pullback: float,
-        volume_ratio: float,
-        symbol: str,
-    ) -> str:
-        """Return the first failing buy-gate condition as a Prometheus label string."""
-        if not trend_ok:
-            return "no_uptrend"
-        if not ema_50_above_200:
-            return "ema_cross"
-        if ema_slope < settings.ema_slope_min_pct:
-            return "ema_slope"
-        if rsi >= settings.rsi_oversold:
-            return "rsi_15m"
-        if rsi_1h < settings.rsi_1h_min:
-            return "rsi_1h"
-        if pullback < settings.pullback_for(symbol):
-            return "pullback"
-        if volume_ratio > settings.max_volume_ratio:
-            return "volume"
-        return "other"
 
     def _maybe_reset_daily(self) -> None:
         today = datetime.utcnow().date()
