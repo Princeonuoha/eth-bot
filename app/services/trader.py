@@ -30,6 +30,7 @@ from app.metrics import (
     bot_position_open,
     bot_signal_skip_total,
     bot_sl_order_active,
+    bot_strategy_info,
     bot_trades_total,
 )
 from app.models.position import Position
@@ -117,6 +118,7 @@ class Trader:
         )
 
         self.strategy = get_strategy()
+        bot_strategy_info.labels(self.strategy.name).set(1)
 
         # Initialise per-symbol state
         self.states: dict[str, SymbolState] = {}
@@ -409,7 +411,7 @@ class Trader:
             bot_signal_skip_total.labels("cooldown").inc()
             return
 
-        if not cg_ok:
+        if not cg_ok and not settings.disable_sentiment_block:
             logger.info(
                 f"[{symbol}] CoinGecko: skipping buy — EXTREME FEAR + price below 200 EMA | {cg.summary}"
             )

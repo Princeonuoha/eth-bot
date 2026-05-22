@@ -58,3 +58,11 @@ bot_daily_pnl_usdc = Gauge(
     "bot_daily_pnl_usdc",
     "Running PnL in USDC for the current UTC day (all symbols combined)",
 )
+
+# ── Strategy info ────────────────────────────────────────────────────────────
+
+bot_strategy_info = Gauge(
+    "bot_strategy_info",
+    "Active strategy info (always 1.0; the name is carried in the label).",
+    ["strategy"],
+)

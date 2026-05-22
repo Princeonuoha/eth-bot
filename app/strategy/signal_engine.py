@@ -29,6 +29,7 @@ from loguru import logger
 
 from app.config import settings
 from app.strategy.base import Strategy
+from app.strategy.active_mean_rev import ActiveMeanRevStrategy
 from app.strategy.pullback import PullbackStrategy
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -37,6 +38,7 @@ from app.strategy.pullback import PullbackStrategy
 
 _STRATEGIES: dict[str, type[Strategy]] = {
     "pullback": PullbackStrategy,
+    "active_mean_rev": ActiveMeanRevStrategy,
 }
 
 

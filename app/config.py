@@ -20,6 +20,43 @@ class Settings(BaseSettings):
         ),
     )
 
+    # Trader-level circuit breakers
+    disable_sentiment_block: bool = Field(
+        default=False,
+        description=(
+            "If True, bypass the CoinGecko extreme-fear circuit breaker in "
+            "trader.py. Useful on testnet so a permissive strategy can actually "
+            "fire trades during bearish sentiment. Leave False in production."
+        ),
+    )
+
+    # Active mean-reversion strategy knobs (own namespace so pullback's
+    # values aren't disturbed when switching with STRATEGY=active_mean_rev)
+    active_rsi_oversold: float = Field(
+        default=50.0,
+        description="Active strategy: 15m RSI must be below this to enter.",
+    )
+    active_pullback_min_pct: float = Field(
+        default=0.3,
+        description="Active strategy: minimum % drop from recent high to enter.",
+    )
+    active_max_volume_ratio: float = Field(
+        default=2.0,
+        description="Active strategy: skip entry if volume_ratio is at or above this.",
+    )
+    active_partial_tp_pct: float = Field(
+        default=0.4,
+        description="Active strategy: % gain at which to take partial profit.",
+    )
+    active_trailing_activation_pct: float = Field(
+        default=0.5,
+        description="Active strategy: gain % at which the trailing stop activates.",
+    )
+    active_trailing_stop_pct: float = Field(
+        default=0.25,
+        description="Active strategy: distance below peak at which trailing stop fires.",
+    )
+
     # Strategy — multi-symbol
     # SYMBOLS takes precedence. Comma-separated: ETHUSDC,BTCUSDC
     # Falls back to SYMBOL for backwards compatibility.
