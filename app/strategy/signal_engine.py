@@ -28,8 +28,8 @@ To add a new strategy:
 from loguru import logger
 
 from app.config import settings
-from app.strategy.base import Strategy
 from app.strategy.active_mean_rev import ActiveMeanRevStrategy
+from app.strategy.base import Strategy
 from app.strategy.pullback import PullbackStrategy
 
 # ─────────────────────────────────────────────────────────────────────────────
